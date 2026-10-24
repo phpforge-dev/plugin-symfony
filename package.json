@@ -1,0 +1,15 @@
+{
+  "name": "@phpforge/plugin-symfony",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --import tsx --test tests/*.test.ts"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12",
+    "tsx": "^4.23.15"
+  }
+}

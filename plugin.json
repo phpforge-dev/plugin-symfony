@@ -1,0 +1,26 @@
+{
+  "id": "phpforge.symfony",
+  "name": "Symfony / Twig",
+  "version": "1.0.0",
+  "minIdeVersion": "0.2.13",
+  "main": "main.js",
+  "description": "Symfony routes, Twig templates, services, parameters and environment references.",
+  "activation": {
+    "languages": [
+      "php",
+      "twig",
+      "yaml"
+    ],
+    "files": [
+      "composer.json"
+    ],
+    "documents": [
+      "templates/**/*.twig",
+      "config/**/*.yaml",
+      "config/**/*.yml"
+    ]
+  },
+  "permissions": [
+    "project.read"
+  ]
+}
