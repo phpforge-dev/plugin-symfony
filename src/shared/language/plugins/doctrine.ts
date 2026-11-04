@@ -172,7 +172,7 @@ export async function buildModel(classes: MappedClass[], repositories: Map<strin
  const resolved = new Map<string, EntityField[]>();
  const fieldsOf = async (c: MappedClass, stack: string[]): Promise<EntityField[]> => {
   const k = key(c.fqcn); const hit = resolved.get(k); if (hit) return hit; if (stack.includes(k)) return [];
-  const list = own(c);
+  const list: EntityField[] = own(c);
   for (const t of c.traits) { const trait = await find(t); if (trait) list.push(...await fieldsOf(trait, [...stack, k])); }
   const parent = c.parent ? await find(c.parent) : undefined;
   // Pai comum não mapeia campos, mas pode herdar de uma superclasse mapeada mais acima.
