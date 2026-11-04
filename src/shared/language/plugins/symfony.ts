@@ -1,8 +1,9 @@
-import { analyze, phpTokens, position, type PhpToken } from '../php-source';
+import { analyze, phpTokens, position, segments, type PhpToken } from '../php-source';
 import { CompletionKind, type CodeCompletion, type CodeSite, type IdePlugin, type PluginCompletion, type PluginDiagnostic, type PluginLocation, type ProjectFiles, type StringSite } from './api';
 import type { PluginFix } from './extensions';
 import { maskEnv, readEnv, type EnvEntry } from '../../env-document';
 import { bundleTemplates, classFile, compiledContainer, parseBundles, parseContainerXml, parsePhpRoutes, parseXmlRoutes, psr4, type Bundle } from './symfony-config';
+import { doctrineContext, entityByName, nearest, parseEntity, repositoryEntity, type Entity, type Model } from './doctrine';
 
 // Symfony (symfony.com/doc): rotas por atributo `#[Route]` e YAML, templates Twig,
 // serviços e parâmetros de config/*.yaml e `%env()%` ligado aos arquivos .env.
@@ -145,6 +146,7 @@ export class SymfonyPlugin implements IdePlugin {
  private container?: Promise<{ services: YamlKey[]; parameters: YamlKey[] }>;
  private env?: Promise<Map<string, EnvEntry>>;
  private bundles?: Promise<(Bundle & { file: string | null })[]>;
+ private model?: Promise<Model>;
  async detect(files: ProjectFiles) {
   const composer = await files.read('composer.json'); if (!composer) return null;
   let json: any; try { json = JSON.parse(composer); } catch { return null; }
@@ -157,7 +159,7 @@ export class SymfonyPlugin implements IdePlugin {
  }
  documents(path: string) { return path.endsWith('.php') || (path.startsWith('templates/') && path.endsWith('.twig')) || (path.startsWith('config/') && /\.ya?ml$/.test(path)); }
  invalidates(path: string) { return /^(src|config|templates)\//.test(path) || /^\.env(\.|$)/.test(path) || /^var\/cache\/[^/]+\/\w+Container\.xml$/.test(path) || path === 'vendor/composer/installed.json' || path === 'composer.json'; }
- invalidate() { this.routes = this.templates = this.container = this.env = this.bundles = undefined; }
+ invalidate() { this.routes = this.templates = this.container = this.env = this.bundles = this.model = undefined; }
  private allRoutes(files: ProjectFiles) {
   return this.routes ??= (async () => {
    const out: SymfonyRoute[] = [];
@@ -187,6 +189,20 @@ export class SymfonyPlugin implements IdePlugin {
    const text = await files.read('config/bundles.php'); if (!text) return [];
    const map = await psr4(files);
    return Promise.all(parseBundles(text).map(async b => ({ ...b, file: await classFile(b.fqcn, map, files) })));
+  })();
+ }
+ private allModel(files: ProjectFiles) {
+  return this.model ??= (async () => {
+   const entities: Entity[] = []; const repositories = new Map<string, string>();
+   // Mapeamento padrão do DoctrineBundle (src/Entity) e repositórios; projetos fora do padrão: todo o src/.
+   let paths = [...await files.list('src/Entity', n => n.endsWith('.php')), ...await files.list('src/Repository', n => n.endsWith('.php'))];
+   if (!paths.length) paths = await files.list('src', n => n.endsWith('.php'));
+   for (const p of paths) {
+    const text = await files.read(p); if (!text) continue;
+    const entity = /Entity/.test(text) ? parseEntity(text, p) : null; if (entity) entities.push(entity);
+    const repo = /EntityRepository/.test(text) ? repositoryEntity(text) : null; if (repo) repositories.set(repo.repository.toLowerCase(), repo.entity);
+   }
+   return { entities, repositories };
   })();
  }
  private allContainer(files: ProjectFiles) {
@@ -287,6 +303,7 @@ export class SymfonyPlugin implements IdePlugin {
  }
  async completeCode(site: CodeSite, files: ProjectFiles): Promise<CodeCompletion | null> {
   const before = site.text.slice(Math.max(0, site.offset - 300), site.offset).split('\n').pop()!;
+  if (site.path.endsWith('.php')) return this.completePhp(site, files);
   if (site.path.endsWith('.twig')) {
    const context = this.twigContext(before); if (!context) return null;
    return { from: site.offset - context.word.length, items: await this.candidates(context.kind, files) };
@@ -301,6 +318,7 @@ export class SymfonyPlugin implements IdePlugin {
  }
  async defineCode(site: CodeSite, files: ProjectFiles): Promise<PluginLocation[] | null> {
   const { line, col } = this.lineAround(site);
+  if (site.path.endsWith('.php')) return this.definePhp(site, files);
   if (site.path.endsWith('.twig')) {
    for (const m of line.matchAll(/(['"])([^'"]*)\1/g)) {
     if (col <= m.index! || col >= m.index! + m[0].length) continue;
@@ -315,6 +333,29 @@ export class SymfonyPlugin implements IdePlugin {
  }
 
 
+ // ── Doctrine e forms ───────────────────────────────────────────────────────────────────────
+ private fieldItems(entity: Entity): PluginCompletion[] {
+  return entity.fields.map(f => ({ label: f.name, kind: f.kind === 'association' ? CompletionKind.Reference : CompletionKind.Field, labelDetails: { description: f.target?.split('\\').pop() ?? f.type ?? '' }, detail: `${entity.name}::$${f.name}` }));
+ }
+ private async completePhp(site: CodeSite, files: ProjectFiles): Promise<CodeCompletion | null> {
+  const model = await this.allModel(files); const context = doctrineContext(model, site.text, site.offset, false); if (!context) return null;
+  const range = { from: context.from, to: context.to };
+  if (context.kind === 'fields' || context.kind === 'alias-field') return { ...range, items: this.fieldItems(context.entity) };
+  if (context.kind === 'aliases') return { ...range, items: [...context.aliases].map(([alias, e]) => ({ label: alias, kind: CompletionKind.Variable, labelDetails: { description: e.fqcn } })) };
+  if (context.kind === 'entity') return { ...range, items: model.entities.map(e => ({ label: e.fqcn, kind: CompletionKind.Module, detail: e.file })).sort((a, b) => a.label.localeCompare(b.label)) };
+  return null;
+ }
+ private async definePhp(site: CodeSite, files: ProjectFiles): Promise<PluginLocation[] | null> {
+  const model = await this.allModel(files); const context = doctrineContext(model, site.text, site.offset, false); if (!context) return null;
+  const at = (file: string, line: number, character: number, length: number) => [{ uri: files.uri(file), range: { start: { line, character }, end: { line, character: character + length } } }];
+  if (context.kind === 'fields' || context.kind === 'alias-field') {
+   const word = context.kind === 'fields' ? context.word : site.text.slice(context.from, context.to);
+   const field = context.entity.fields.find(f => f.name === word); return field ? at(context.entity.file, field.line, field.character, field.name.length + 1) : [];
+  }
+  if (context.kind === 'entity') { const e = entityByName(model, site.text.slice(context.from, context.to)); return e ? at(e.file, e.line, e.character, e.name.length) : []; }
+  if (context.kind === 'aliases') { const e = context.aliases.get(site.text.slice(context.from, context.to)); return e ? at(e.file, e.line, e.character, e.name.length) : []; }
+  return null;
+ }
 
  // ── Diagnósticos ───────────────────────────────────────────────────────────────────────────
  async diagnose(path: string, text: string, files: ProjectFiles): Promise<PluginDiagnostic[]> {
@@ -324,7 +365,28 @@ export class SymfonyPlugin implements IdePlugin {
   if (path === 'config/bundles.php') for (const b of await this.allBundles(files)) {
    if (!b.file) out.push({ range: { start: { line: b.line, character: b.character }, end: { line: b.line, character: b.character + b.length } }, message: `Bundle ${b.fqcn} não encontrado pelo autoload (composer.json/vendor). Rode composer install ou corrija o nome.`, code: 'symfony.bundle.missing', severity: 'error' });
   }
-
+  const model = await this.allModel(files); if (!model.entities.length) return out;
+  for (const segment of segments(text)) {
+   if (segment.kind !== 'string' || (segment.quote !== "'" && segment.quote !== '"')) continue;
+   const value = text.slice(segment.start + 1, segment.end - 1);
+   const before = text.slice(Math.max(0, segment.start - 300), segment.start);
+   if (!/\w\.\w/.test(value) && !/->(findBy|findOneBy|count)\s*\(/.test(before)) continue;
+   if (!/->(findBy|findOneBy|count|createQuery|select|addSelect|where|andWhere|orWhere|orderBy|addOrderBy|groupBy|addGroupBy|having|andHaving|orHaving|join|leftJoin|innerJoin|indexBy)\s*\([^;]*$/.test(before)) continue;
+   const probe = doctrineContext(model, text, segment.start + 1); if (!probe) continue;
+   const report = (entity: Entity, word: string, from: number) => {
+    if (!word || entity.fields.some(f => f.name === word)) return;
+    const near = nearest(word, entity.fields.map(f => f.name));
+    out.push({ range: range(from, from + word.length), message: `Campo '${word}' não existe em ${entity.fqcn}.${near ? ` Você quis dizer '${near}'?` : ''}`, code: 'symfony.doctrine.field', severity: 'warning',
+     ...(near ? { fixes: [{ title: `Trocar por '${near}'`, edits: [{ uri: files.uri(path), range: range(from, from + word.length), newText: near }] }] } : {}) });
+   };
+   if (probe.kind === 'fields' && probe.source === 'findBy') report(probe.entity, value, segment.start + 1);
+   else if (probe.kind === 'alias-field' || probe.kind === 'aliases') {
+    for (const m of value.matchAll(/(?<![\w.:])(\w+)\.(\w+)\b/g)) {
+     const ctx = doctrineContext(model, text, segment.start + 1 + m.index! + m[1].length + 1);
+     if (ctx?.kind === 'alias-field') report(ctx.entity, m[2], segment.start + 1 + m.index! + m[1].length + 1);
+    }
+   }
+  }
   return out;
  }
 }
