@@ -47,6 +47,29 @@ export function parseXmlRoutes(text: string, file: string): Route[] {
  });
 }
 
+/** Serviços (filhos diretos de `<services>`, sem ids ocultos `.x`) e parâmetros do container compilado. */
+export function parseContainerXml(text: string, file: string): { services: Definition[]; parameters: Definition[] } {
+ const tags = xmlTags(text); const services: Definition[] = []; const parameters: Definition[] = [];
+ let servicesDepth = -1; let parametersDepth = -1;
+ tags.forEach((t, index) => {
+  if (t.close) { if (t.name === 'services' && t.depth === servicesDepth) servicesDepth = -1; if (t.name === 'parameters' && t.depth === parametersDepth) parametersDepth = -1; return; }
+  if (t.name === 'services') servicesDepth = t.depth;
+  else if (t.name === 'parameters' && parametersDepth < 0) parametersDepth = t.depth;
+  else if (t.name === 'service' && servicesDepth >= 0 && t.depth === servicesDepth + 1 && t.attrs.id && !t.attrs.id.value.startsWith('.')) {
+   const at = position(text, t.attrs.id.offset);
+   services.push({ key: t.attrs.id.value, file, ...at, ...(t.attrs.class ? { class: t.attrs.class.value } : {}), ...(t.attrs.alias ? { value: '@' + t.attrs.alias.value } : {}) });
+  } else if (t.name === 'parameter' && parametersDepth >= 0 && t.depth === parametersDepth + 1 && t.attrs.key) {
+   const value = t.attrs.type?.value === 'collection' ? '[…]' : t.attrs.value?.value ?? xmlText(text, tags, index);
+   parameters.push({ key: t.attrs.key.value, file, ...position(text, t.attrs.key.offset), ...(value ? { value } : {}) });
+  }
+ });
+ return { services, parameters };
+}
+/** Container compilado: `var/cache/<env>/<Kernel>Container.xml`, preferindo o ambiente dev. */
+export async function compiledContainer(files: ProjectFiles): Promise<string | null> {
+ const list = (await files.list('var/cache', n => /Container\.xml$/.test(n))).filter(p => /^var\/cache\/[^/]+\/\w+Container\.xml$/.test(p));
+ return list.sort((a, b) => Number(!a.includes('/dev/')) - Number(!b.includes('/dev/')) || a.localeCompare(b))[0] ?? null;
+}
 
 // ── PHP ─────────────────────────────────────────────────────────────────────────────────────────
 /** Argumentos de nível zero da chamada cujo `(` está em `open`. */

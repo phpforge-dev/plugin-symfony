@@ -2,14 +2,14 @@ import { analyze, phpTokens, position, type PhpToken } from '../php-source';
 import { CompletionKind, type CodeCompletion, type CodeSite, type IdePlugin, type PluginCompletion, type PluginDiagnostic, type PluginLocation, type ProjectFiles, type StringSite } from './api';
 import type { PluginFix } from './extensions';
 import { maskEnv, readEnv, type EnvEntry } from '../../env-document';
-import { bundleTemplates, classFile, parseBundles, parsePhpRoutes, parseXmlRoutes, psr4, type Bundle } from './symfony-config';
+import { bundleTemplates, classFile, compiledContainer, parseBundles, parseContainerXml, parsePhpRoutes, parseXmlRoutes, psr4, type Bundle } from './symfony-config';
 
 // Symfony (symfony.com/doc): rotas por atributo `#[Route]` e YAML, templates Twig,
 // serviços e parâmetros de config/*.yaml e `%env()%` ligado aos arquivos .env.
 // Implementação própria a partir da documentação pública; não usa código de plugins existentes.
 
 export type SymfonyRoute = { name: string; path: string; methods: string; file: string; line: number; character: number; length: number; generated?: boolean };
-export type YamlKey = { key: string; file: string; line: number; character: number; value?: string; class?: string };
+export type YamlKey = { key: string; file: string; line: number; character: number; value?: string; class?: string; compiled?: boolean };
 
 const argumentsAt = (tokens: PhpToken[], open: number) => {
  const args: PhpToken[][] = [[]]; let depth = 0; let i = open + 1;
@@ -156,7 +156,7 @@ export class SymfonyPlugin implements IdePlugin {
   return { version: version ? `${version[1]}.${version[2]}` : undefined };
  }
  documents(path: string) { return path.endsWith('.php') || (path.startsWith('templates/') && path.endsWith('.twig')) || (path.startsWith('config/') && /\.ya?ml$/.test(path)); }
- invalidates(path: string) { return /^(src|config|templates)\//.test(path) || /^\.env(\.|$)/.test(path) || path === 'vendor/composer/installed.json' || path === 'composer.json'; }
+ invalidates(path: string) { return /^(src|config|templates)\//.test(path) || /^\.env(\.|$)/.test(path) || /^var\/cache\/[^/]+\/\w+Container\.xml$/.test(path) || path === 'vendor/composer/installed.json' || path === 'composer.json'; }
  invalidate() { this.routes = this.templates = this.container = this.env = this.bundles = undefined; }
  private allRoutes(files: ProjectFiles) {
   return this.routes ??= (async () => {
@@ -196,6 +196,15 @@ export class SymfonyPlugin implements IdePlugin {
     if (/^config\/routes/.test(p)) continue;
     const parsed = parseServices((await files.read(p)) ?? '', p); services.push(...parsed.services); parameters.push(...parsed.parameters);
    }
+   // Container compilado: completa o que a configuração não declara (serviços de bundles, parâmetros resolvidos).
+   const compiled = await compiledContainer(files);
+   if (compiled) {
+    const parsed = parseContainerXml((await files.read(compiled)) ?? '', compiled);
+    const known = (list: YamlKey[]) => new Set(list.map(i => i.key));
+    const s = known(services); const p = known(parameters);
+    services.push(...parsed.services.filter(i => !s.has(i.key)).map(i => ({ ...i, compiled: true })));
+    parameters.push(...parsed.parameters.filter(i => !p.has(i.key)).map(i => ({ ...i, compiled: true })));
+   }
    return { services, parameters };
   })();
  }
@@ -207,6 +216,8 @@ export class SymfonyPlugin implements IdePlugin {
   if (argument === 0 && ['->render', '->renderView', '->renderBlock', '->renderBlockView', '->stream', 'Template'].includes(callee)) return 'template';
   if (argument === 0 && ['->getParameter', 'param'].includes(callee)) return 'parameter';
   if (argument === 0 && ['service'].includes(callee) && !/\bfunction\s*$/.test(text.slice(0, literal.start))) return 'service';
+  // `$container->get('id')`, `$this->container->has('id')`, `$this->get('id')` (AbstractController antigo).
+  if (argument === 0 && (callee === '->get' || callee === '->has') && /(?:container|locator|\$this)\s*->\s*(?:get|has)\s*\(\s*$/i.test(text.slice(Math.max(0, literal.start - 80), literal.start))) return 'service';
   if (callee === 'Autowire' || callee === 'Target') {
    const label = /\b(service|param|env|value|expression)\s*:\s*$/.exec(text.slice(Math.max(0, literal.start - 40), literal.start))?.[1];
    return label === 'service' ? 'service' : label === 'param' ? 'parameter' : label === 'env' ? 'env' : label === 'expression' ? null : 'reference';
@@ -221,7 +232,7 @@ export class SymfonyPlugin implements IdePlugin {
    .map(e => ({ label: e.key, kind: CompletionKind.Constant, labelDetails: { detail: ` = ${maskEnv(e.key, e.value)}` }, detail: e.file }));
   const { services, parameters } = await this.allContainer(files);
   if (kind === 'service') return services.slice().sort((a, b) => a.key.localeCompare(b.key))
-   .map(s => ({ label: s.key, kind: CompletionKind.Module, ...(s.class || s.value ? { labelDetails: { description: s.value ?? s.class } } : {}), detail: `${s.file}:${s.line + 1}` }));
+   .map(s => ({ label: s.key, kind: CompletionKind.Module, ...(s.class || s.value ? { labelDetails: { description: s.value ?? s.class } } : {}), detail: `${s.file}:${s.line + 1}${s.compiled ? ' · container compilado' : ''}` }));
   const seen = new Set<string>(); const out: PluginCompletion[] = [];
   for (const p of parameters) if (!seen.has(p.key)) { seen.add(p.key); out.push({ label: p.key, kind: CompletionKind.Property, ...(p.value ? { labelDetails: { description: maskEnv(p.key, p.value) } } : {}), detail: `${p.file}:${p.line + 1}` }); }
   for (const k of kernelParameters) if (!seen.has(k)) out.push({ label: k, kind: CompletionKind.Constant, detail: 'Parâmetro do kernel' });

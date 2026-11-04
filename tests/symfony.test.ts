@@ -81,7 +81,7 @@ test('PHP: completion e navegação de rotas, templates, parâmetros e Autowire'
  const envTarget = await h.define('src/Controller/BlogController.php', controller, at(controller, "Autowire('%env(APP_S"));
  assert.deepEqual(envTarget!.map(l => [l.uri.split('/').pop(), l.range.start.line]), [['.env', 1]]);
  const services = await h.complete('src/Controller/BlogController.php', controller, at(controller, "service: '"));
- assert.deepEqual(services!.items.map(i => i.label), ['app.clock', 'app.mailer', 'App\\Service\\Clock']);
+ assert.deepEqual(services!.items.map(i => i.label), ['app.clock', 'app.mailer', 'App\\Service\\Clock', 'router', 'service_container', 'Symfony\\Component\\Routing\\RouterInterface', 'translator']);
  const service = await h.define('src/Controller/BlogController.php', controller, at(controller, "service: 'app.ma"));
  assert.deepEqual(service!.map(l => [l.uri.split('/').pop(), l.range.start.line]), [['services.yaml', 12]]);
 });
@@ -103,7 +103,7 @@ test('Twig: path()/url() e extends/include', async () => {
 test('YAML: @serviço, %parâmetro% e %env()% com completion e navegação', async () => {
  const h = host(); const yaml = read('config/services.yaml'); const path = 'config/services.yaml';
  const services = await h.completeCode(path, yaml, at(yaml, "'@app."));
- assert.deepEqual(services!.items.map(i => i.label), ['app.clock', 'app.mailer', 'App\\Service\\Clock']);
+ assert.deepEqual(services!.items.map(i => i.label), ['app.clock', 'app.mailer', 'App\\Service\\Clock', 'router', 'service_container', 'Symfony\\Component\\Routing\\RouterInterface', 'translator']);
  const params = await h.completeCode(path, yaml.replace("'%app.admin_email%'", "'%app.ad"), at(yaml, "'%app.ad"));
  assert.equal(params!.items.find(i => i.label === 'app.admin_email')!.textEdit.newText, 'app.admin_email%');
  const env = await h.completeCode(path, yaml, at(yaml, "'%env(MA"));
