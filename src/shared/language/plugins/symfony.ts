@@ -1,13 +1,15 @@
-import { analyze, phpTokens, position, segments, type PhpToken } from '../php-source';
+import { analyze, literalAt, phpTokens, position, segments, type PhpToken } from '../php-source';
 import { CompletionKind, type CodeCompletion, type CodeSite, type IdePlugin, type PluginCompletion, type PluginDiagnostic, type PluginLocation, type ProjectFiles, type StringSite } from './api';
 import type { PluginFix } from './extensions';
 import { maskEnv, readEnv, type EnvEntry } from '../../env-document';
 import { bundleTemplates, classFile, compiledContainer, parseBundles, parseContainerXml, parsePhpRoutes, parseXmlRoutes, psr4, type Bundle } from './symfony-config';
-import { doctrineContext, entityByName, nearest, parseEntity, repositoryEntity, type Entity, type Model } from './doctrine';
+import { doctrineContext, entityByName, formOptions, formTranslationOption, nearest, parseEntity, repositoryEntity, type Entity, type Model } from './doctrine';
 import { loadCatalog, phpTransSite, phpTransSites, twigTransSite, twigTransSites, type Catalog, type TransSite } from './translations';
 
-// Symfony (symfony.com/doc): rotas por atributo `#[Route]` e YAML, templates Twig,
-// serviços e parâmetros de config/*.yaml e `%env()%` ligado aos arquivos .env.
+// Symfony (symfony.com/doc): rotas por atributo `#[Route]`, YAML, PHP e XML, templates Twig
+// (inclusive `@Bundle/` de config/bundles.php), serviços e parâmetros de config/*.yaml e do
+// container compilado, `%env()%` ligado aos .env, Doctrine (findBy, QueryBuilder, DQL), forms
+// e traduções.
 // Implementação própria a partir da documentação pública; não usa código de plugins existentes.
 
 export type SymfonyRoute = { name: string; path: string; methods: string; file: string; line: number; character: number; length: number; generated?: boolean };
@@ -269,9 +271,11 @@ export class SymfonyPlugin implements IdePlugin {
  async completeString(site: StringSite, files: ProjectFiles) {
   const kind = this.kind(site);
   if (!kind) {
-   // Chave de tradução ocupa a string inteira.
+   // Chave de tradução e campo do data_class em `->add()` ocupam a string inteira.
    const trans = phpTransSite(site.text, site.literal.start + 1);
    if (trans) return this.messages(trans.domain, files);
+   const context = doctrineContext(await this.allModel(files), site.text, site.literal.start + 1);
+   if (context?.kind === 'fields' && context.source === 'form') return this.fieldItems(context.entity);
    return null;
   }
   if (kind !== 'reference') return this.candidates(kind, files);
@@ -364,17 +368,20 @@ export class SymfonyPlugin implements IdePlugin {
   return entity.fields.map(f => ({ label: f.name, kind: f.kind === 'association' ? CompletionKind.Reference : CompletionKind.Field, labelDetails: { description: f.target?.split('\\').pop() ?? f.type ?? '' }, detail: `${entity.name}::$${f.name}` }));
  }
  private async completePhp(site: CodeSite, files: ProjectFiles): Promise<CodeCompletion | null> {
-  const model = await this.allModel(files); const context = doctrineContext(model, site.text, site.offset, false); if (!context) return null;
+  const option = formTranslationOption(site.text, site.offset);
+  if (option) { const trans = phpTransSiteAt(site.text, site.offset); return trans ? { from: trans.from, to: trans.to, items: await this.messages(option.domain ?? 'messages', files) } : null; }
+  const model = await this.allModel(files); const context = doctrineContext(model, site.text, site.offset); if (!context) return null;
   const range = { from: context.from, to: context.to };
   if (context.kind === 'fields' || context.kind === 'alias-field') return { ...range, items: this.fieldItems(context.entity) };
   if (context.kind === 'aliases') return { ...range, items: [...context.aliases].map(([alias, e]) => ({ label: alias, kind: CompletionKind.Variable, labelDetails: { description: e.fqcn } })) };
   if (context.kind === 'entity') return { ...range, items: model.entities.map(e => ({ label: e.fqcn, kind: CompletionKind.Module, detail: e.file })).sort((a, b) => a.label.localeCompare(b.label)) };
-  return null;
+  return { ...range, items: formOptions(context.type).map(o => ({ label: o.name, kind: CompletionKind.Property, ...(o.own ? { labelDetails: { description: context.type === 'resolver' ? 'OptionsResolver' : context.type } } : {}) })) };
  }
  private async definePhp(site: CodeSite, files: ProjectFiles): Promise<PluginLocation[] | null> {
   const trans = phpTransSite(site.text, site.offset);
   if (trans) return this.messageLocations(trans, files);
-  const model = await this.allModel(files); const context = doctrineContext(model, site.text, site.offset, false); if (!context) return null;
+  if (formTranslationOption(site.text, site.offset)) { const t = phpTransSiteAt(site.text, site.offset); return t ? this.messageLocations({ ...t, domain: formTranslationOption(site.text, site.offset)!.domain ?? 'messages' }, files) : null; }
+  const model = await this.allModel(files); const context = doctrineContext(model, site.text, site.offset); if (!context) return null;
   const at = (file: string, line: number, character: number, length: number) => [{ uri: files.uri(file), range: { start: { line, character }, end: { line, character: character + length } } }];
   if (context.kind === 'fields' || context.kind === 'alias-field') {
    const word = context.kind === 'fields' ? context.word : site.text.slice(context.from, context.to);
@@ -432,4 +439,9 @@ export class SymfonyPlugin implements IdePlugin {
   const quoted = `'${site.key.replace(/'/g, "''")}'`;
   return { title: `Criar a chave '${site.key}' em ${file}`, edits: [{ uri: files.uri(file), range: { start: end, end }, newText: `${content && !content.endsWith('\n') ? '\n' : ''}${quoted}: ${quoted}\n` }] };
  }
+}
+
+/** Faixa de conteúdo da string sob o cursor (valor de opção de form). */
+function phpTransSiteAt(text: string, offset: number) {
+ const literal = literalAt(text, offset); return literal ? { from: literal.start + 1, to: literal.closed ? literal.end - 1 : offset, key: literal.value, domain: 'messages', closed: !!literal.closed } : null;
 }
