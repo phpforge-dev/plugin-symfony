@@ -1,0 +1,20 @@
+{
+    "packages": [
+        {
+            "name": "acme/demo-bundle",
+            "version": "1.2.0",
+            "type": "symfony-bundle",
+            "autoload": { "psr-4": { "Acme\\DemoBundle\\": "src/" } },
+            "install-path": "../acme/demo-bundle"
+        },
+        {
+            "name": "symfony/framework-bundle",
+            "version": "v7.1.4",
+            "type": "symfony-bundle",
+            "autoload": { "psr-4": { "Symfony\\Bundle\\FrameworkBundle\\": "" } },
+            "install-path": "../symfony/framework-bundle"
+        }
+    ],
+    "dev": true,
+    "dev-package-names": []
+}

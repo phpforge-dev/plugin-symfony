@@ -1,0 +1,5 @@
+{% extends '@AcmeDemo/panel/layout.html.twig' %}
+{% block panel %}
+<h1>{{ 'admin.title'|trans }}</h1>
+<nav>{{ 'menu.users'|trans({}, 'admin') }} {{ 'nope.missing'|trans }}</nav>
+{% endblock %}

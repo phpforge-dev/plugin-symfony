@@ -1,7 +1,8 @@
 import { analyze, phpTokens, position, type PhpToken } from '../php-source';
-import { CompletionKind, type CodeCompletion, type CodeSite, type IdePlugin, type PluginCompletion, type PluginLocation, type ProjectFiles, type StringSite } from './api';
+import { CompletionKind, type CodeCompletion, type CodeSite, type IdePlugin, type PluginCompletion, type PluginDiagnostic, type PluginLocation, type ProjectFiles, type StringSite } from './api';
+import type { PluginFix } from './extensions';
 import { maskEnv, readEnv, type EnvEntry } from '../../env-document';
-import { parsePhpRoutes, parseXmlRoutes } from './symfony-config';
+import { bundleTemplates, classFile, parseBundles, parsePhpRoutes, parseXmlRoutes, psr4, type Bundle } from './symfony-config';
 
 // Symfony (symfony.com/doc): rotas por atributo `#[Route]` e YAML, templates Twig,
 // serviços e parâmetros de config/*.yaml e `%env()%` ligado aos arquivos .env.
@@ -140,9 +141,10 @@ export class SymfonyPlugin implements IdePlugin {
  readonly id = 'symfony';
  readonly name = 'Symfony';
  private routes?: Promise<SymfonyRoute[]>;
- private templates?: Promise<string[]>;
+ private templates?: Promise<Map<string, string>>;
  private container?: Promise<{ services: YamlKey[]; parameters: YamlKey[] }>;
  private env?: Promise<Map<string, EnvEntry>>;
+ private bundles?: Promise<(Bundle & { file: string | null })[]>;
  async detect(files: ProjectFiles) {
   const composer = await files.read('composer.json'); if (!composer) return null;
   let json: any; try { json = JSON.parse(composer); } catch { return null; }
@@ -154,8 +156,8 @@ export class SymfonyPlugin implements IdePlugin {
   return { version: version ? `${version[1]}.${version[2]}` : undefined };
  }
  documents(path: string) { return path.endsWith('.php') || (path.startsWith('templates/') && path.endsWith('.twig')) || (path.startsWith('config/') && /\.ya?ml$/.test(path)); }
- invalidates(path: string) { return /^(src|config|templates)\//.test(path) || /^\.env(\.|$)/.test(path); }
- invalidate() { this.routes = this.templates = this.container = this.env = undefined; }
+ invalidates(path: string) { return /^(src|config|templates)\//.test(path) || /^\.env(\.|$)/.test(path) || path === 'vendor/composer/installed.json' || path === 'composer.json'; }
+ invalidate() { this.routes = this.templates = this.container = this.env = this.bundles = undefined; }
  private allRoutes(files: ProjectFiles) {
   return this.routes ??= (async () => {
    const out: SymfonyRoute[] = [];
@@ -168,7 +170,25 @@ export class SymfonyPlugin implements IdePlugin {
    return out;
   })();
  }
- private allTemplates(files: ProjectFiles) { return this.templates ??= files.list('templates', n => n.endsWith('.twig')).then(list => list.map(p => p.slice('templates/'.length)).sort()); }
+ /** Nome lógico → arquivo: `templates/` do projeto e `@Alias/` dos bundles ativos. */
+ private allTemplates(files: ProjectFiles) {
+  return this.templates ??= (async () => {
+   const map = new Map<string, string>();
+   for (const p of (await files.list('templates', n => n.endsWith('.twig'))).sort()) map.set(p.slice('templates/'.length), p);
+   for (const b of await this.allBundles(files)) {
+    const found = b.file ? await bundleTemplates(b.file, files) : null;
+    for (const t of found?.templates ?? []) map.set(`@${b.alias}/${t}`, `${found!.dir}/${t}`);
+   }
+   return map;
+  })();
+ }
+ private allBundles(files: ProjectFiles) {
+  return this.bundles ??= (async () => {
+   const text = await files.read('config/bundles.php'); if (!text) return [];
+   const map = await psr4(files);
+   return Promise.all(parseBundles(text).map(async b => ({ ...b, file: await classFile(b.fqcn, map, files) })));
+  })();
+ }
  private allContainer(files: ProjectFiles) {
   return this.container ??= (async () => {
    const services: YamlKey[] = []; const parameters: YamlKey[] = [];
@@ -196,7 +216,7 @@ export class SymfonyPlugin implements IdePlugin {
  private async candidates(kind: Kind, files: ProjectFiles): Promise<PluginCompletion[]> {
   if (kind === 'route') return (await this.allRoutes(files)).slice().sort((a, b) => a.name.localeCompare(b.name))
    .map(r => ({ label: r.name, kind: CompletionKind.Reference, labelDetails: { detail: ` ${r.methods}`, description: r.path }, detail: `${r.file}:${r.line + 1}${r.generated ? ' · nome automático' : ''}` }));
-  if (kind === 'template') return (await this.allTemplates(files)).map(t => ({ label: t, kind: CompletionKind.File }));
+  if (kind === 'template') return [...(await this.allTemplates(files))].map(([t, file]) => ({ label: t, kind: CompletionKind.File, ...(t.startsWith('@') ? { detail: file } : {}) }));
   if (kind === 'env') return [...(await this.allEnv(files)).values()].sort((a, b) => a.key.localeCompare(b.key))
    .map(e => ({ label: e.key, kind: CompletionKind.Constant, labelDetails: { detail: ` = ${maskEnv(e.key, e.value)}` }, detail: e.file }));
   const { services, parameters } = await this.allContainer(files);
@@ -210,7 +230,7 @@ export class SymfonyPlugin implements IdePlugin {
  private async locate(kind: Kind, value: string, files: ProjectFiles): Promise<PluginLocation[]> {
   const at = (file: string, line: number, character: number, length = 0, preserveView = false) => ({ uri: files.uri(file), range: { start: { line, character }, end: { line, character: character + length } }, ...(preserveView ? { preserveView } : {}) });
   if (kind === 'route') return (await this.allRoutes(files)).filter(r => r.name === value).map(r => at(r.file, r.line, r.character, r.length));
-  if (kind === 'template') return (await this.allTemplates(files)).includes(value) ? [at(`templates/${value}`, 0, 0, 0, true)] : [];
+  if (kind === 'template') { const file = (await this.allTemplates(files)).get(value); return file ? [at(file, 0, 0, 0, true)] : []; }
   if (kind === 'env') { const e = (await this.allEnv(files)).get(value); return e ? [at(e.file, e.line, 0, e.key.length)] : []; }
   const { services, parameters } = await this.allContainer(files);
   return (kind === 'service' ? services : parameters).filter(s => s.key === value).map(s => at(s.file, s.line, s.character, s.key.length));
@@ -284,4 +304,16 @@ export class SymfonyPlugin implements IdePlugin {
  }
 
 
+
+ // ── Diagnósticos ───────────────────────────────────────────────────────────────────────────
+ async diagnose(path: string, text: string, files: ProjectFiles): Promise<PluginDiagnostic[]> {
+  const out: (PluginDiagnostic & { fixes?: PluginFix[] })[] = [];
+  const range = (from: number, to: number) => ({ start: position(text, from), end: position(text, to) });
+  if (!path.endsWith('.php')) return out;
+  if (path === 'config/bundles.php') for (const b of await this.allBundles(files)) {
+   if (!b.file) out.push({ range: { start: { line: b.line, character: b.character }, end: { line: b.line, character: b.character + b.length } }, message: `Bundle ${b.fqcn} não encontrado pelo autoload (composer.json/vendor). Rode composer install ou corrija o nome.`, code: 'symfony.bundle.missing', severity: 'error' });
+  }
+
+  return out;
+ }
 }

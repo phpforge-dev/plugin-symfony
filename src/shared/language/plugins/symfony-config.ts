@@ -1,4 +1,5 @@
 import { phpTokens, position, type PhpToken } from '../php-source';
+import type { ProjectFiles } from './api';
 
 // Fontes de configuração do Symfony além de atributos/YAML (symfony.com/doc): rotas em PHP
 // (RoutingConfigurator) e XML, config/bundles.php, autoload PSR-4 do Composer para achar o
@@ -82,4 +83,48 @@ export function parsePhpRoutes(text: string, file: string): Route[] {
  return out;
 }
 
+export type Bundle = { fqcn: string; name: string; alias: string; envs: string[]; line: number; character: number; length: number };
+/** `Classe::class => ['all' => true]` de config/bundles.php; `alias` é o namespace Twig (`@AcmeDemo`). */
+export function parseBundles(text: string): Bundle[] {
+ const tokens = phpTokens(text); const out: Bundle[] = [];
+ for (let i = 0; i < tokens.length; i++) {
+  if (tokens[i].value !== '::' || tokens[i + 1]?.value !== 'class' || tokens[i + 2]?.value !== '=>') continue;
+  let k = i - 1; while (k >= 0 && (tokens[k].value === '\\' || tokens[k].type === 'word') && !(tokens[k].type === 'word' && tokens[k - 1]?.type === 'word')) k--;
+  const parts = tokens.slice(k + 1, i); const fqcn = parts.map(t => t.value).join('').replace(/^\\/, ''); if (!fqcn) continue;
+  const envs: string[] = [];
+  if (tokens[i + 3]?.value === '[') for (const arg of callArguments(tokens, i + 3).args) if (arg[0]?.type === 'string' && arg[1]?.value === '=>' && arg[2]?.value.toLowerCase() === 'true') envs.push(arg[0].value);
+  const name = fqcn.split('\\').pop()!; const first = parts.find(t => t.type === 'word')!;
+  out.push({ fqcn, name, alias: name.replace(/Bundle$/, ''), envs, ...position(text, first.offset), length: tokens[i - 1].offset + tokens[i - 1].value.length - first.offset });
+ }
+ return out;
+}
 
+const normalize = (path: string) => { const out: string[] = []; for (const p of path.split('/')) { if (!p || p === '.') continue; if (p === '..') out.pop(); else out.push(p); } return out.join('/'); };
+/** Prefixos PSR-4 do projeto (composer.json) e das dependências (vendor/composer/installed.json). */
+export async function psr4(files: ProjectFiles): Promise<{ prefix: string; dir: string }[]> {
+ const json = async (path: string) => { try { const t = await files.read(path); return t ? JSON.parse(t) : null; } catch { return null; } };
+ const out: { prefix: string; dir: string }[] = [];
+ const add = (map: Record<string, string | string[]> | undefined, base: string) => { for (const [prefix, dirs] of Object.entries(map ?? {})) for (const dir of ([] as string[]).concat(dirs)) out.push({ prefix, dir: normalize(`${base}/${dir}`) }); };
+ const project = await json('composer.json'); add(project?.autoload?.['psr-4'], ''); add(project?.['autoload-dev']?.['psr-4'], '');
+ const installed = await json('vendor/composer/installed.json');
+ for (const p of (Array.isArray(installed) ? installed : installed?.packages ?? []) as any[]) add(p.autoload?.['psr-4'], normalize(`vendor/composer/${p['install-path'] ?? `../${p.name}`}`));
+ return out.sort((a, b) => b.prefix.length - a.prefix.length);
+}
+/** Arquivo de uma classe pelo PSR-4 (o primeiro prefixo mais longo cujo arquivo existe). */
+export async function classFile(fqcn: string, map: { prefix: string; dir: string }[], files: ProjectFiles): Promise<string | null> {
+ for (const { prefix, dir } of map) {
+  if (!fqcn.startsWith(prefix)) continue;
+  const path = normalize(`${dir}/${fqcn.slice(prefix.length).replace(/\\/g, '/')}.php`);
+  if (await files.exists(path)) return path;
+ }
+ return null;
+}
+/** Diretório de templates do bundle: `Resources/views` (estrutura antiga) ou `templates/` na raiz do pacote. */
+export async function bundleTemplates(classPath: string, files: ProjectFiles): Promise<{ dir: string; templates: string[] } | null> {
+ const dir = classPath.split('/').slice(0, -1).join('/');
+ for (const candidate of [`${dir}/Resources/views`, normalize(`${dir}/../templates`), `${dir}/templates`]) {
+  const templates = await files.list(candidate, n => n.endsWith('.twig'));
+  if (templates.length) return { dir: candidate, templates: templates.map(t => t.slice(candidate.length + 1)).sort() };
+ }
+ return null;
+}

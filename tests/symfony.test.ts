@@ -68,7 +68,7 @@ test('PHP: completion e navegação de rotas, templates, parâmetros e Autowire'
  const target = await h.define('src/Controller/BlogController.php', controller, routeSite + 2);
  assert.deepEqual(target!.map(l => [l.uri.split('/').pop(), l.range.start.line]), [['BlogController.php', line(controller, "name: 'index'")]]);
  const templates = await h.complete('src/Controller/BlogController.php', controller, at(controller, "render('"));
- assert.deepEqual(templates!.items.map(i => i.label), ['base.html.twig', 'blog/index.html.twig']);
+ assert.deepEqual(templates!.items.map(i => i.label), ['admin/dashboard.html.twig', 'base.html.twig', 'blog/index.html.twig', '@AcmeDemo/panel/layout.html.twig']);
  const template = await h.define('src/Controller/BlogController.php', controller, at(controller, "render('blog"));
  assert.deepEqual(template!.map(l => [l.uri.endsWith('templates/blog/index.html.twig'), l.preserveView]), [[true, true]]);
  const params = await h.complete('src/Controller/BlogController.php', controller, at(controller, "getParameter('"));
@@ -94,7 +94,7 @@ test('Twig: path()/url() e extends/include', async () => {
  const route = await h.defineCode(path, twig, at(twig, "path('blog_s"));
  assert.deepEqual(route!.map(l => l.range.start.line), [line(controller, "name: 'show'")]);
  const includes = await h.completeCode(path, twig, at(twig, "include('"));
- assert.deepEqual(includes!.items.map(i => i.label), ['base.html.twig', 'blog/index.html.twig']);
+ assert.deepEqual(includes!.items.map(i => i.label), ['admin/dashboard.html.twig', 'base.html.twig', 'blog/index.html.twig', '@AcmeDemo/panel/layout.html.twig']);
  const base = await h.defineCode(path, twig, at(twig, "extends 'ba"));
  assert.ok(base![0].uri.endsWith('templates/base.html.twig'));
  assert.equal(await h.completeCode(path, twig, at(twig, '<a href')), null);
