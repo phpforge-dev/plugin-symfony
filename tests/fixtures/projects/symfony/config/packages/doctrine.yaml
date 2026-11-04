@@ -1,0 +1,11 @@
+doctrine:
+    orm:
+        mappings:
+            App:
+                type: attribute
+                dir: '%kernel.project_dir%/src/Entity'
+                prefix: 'App\Entity'
+            Legacy:
+                type: xml
+                dir: '%kernel.project_dir%/config/doctrine_legacy'
+                prefix: 'App\Legacy'

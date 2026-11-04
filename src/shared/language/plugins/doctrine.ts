@@ -1,13 +1,16 @@
 import { analyze, codeOnly, namespaceAt, phpTokens, position, segments, type Literal, type PhpToken } from '../php-source';
 import { callSite } from './host';
 import { literalIn, prepared } from './prepared';
+import { xmlTags } from './symfony-config';
 
 // Doctrine ORM (doctrine-project.org/projects/orm): mapeamento por atributos `#[ORM\...]` ou
 // anotações `@ORM\...`, repositórios, chaves de findBy/findOneBy/count, aliases de QueryBuilder e
 // DQL. Formulários: `->add()` com campos do `data_class` e opções conhecidas dos tipos do Symfony.
 
-export type EntityField = { name: string; kind: 'field' | 'association' | 'embedded'; type?: string; target?: string; offset: number; line: number; character: number };
+export type EntityField = { name: string; kind: 'field' | 'association' | 'embedded'; type?: string; target?: string; offset: number; line: number; character: number; file?: string; owner?: string };
 export type Entity = { fqcn: string; name: string; file: string; repository?: string; fields: EntityField[]; line: number; character: number };
+/** Classe com mapeamento (ou candidata a herdar um): entidade, superclasse mapeada, embeddable, trait. */
+export type MappedClass = Entity & { kind: 'entity' | 'superclass' | 'embeddable' | 'trait' | 'class'; parent?: string; traits: string[]; source: 'php' | 'xml' };
 
 /** Resolve um nome de classe como o PHP: imports, namespace atual, nome totalmente qualificado. */
 export function resolver(text: string) {
@@ -25,15 +28,24 @@ export function resolver(text: string) {
 export const withoutComments = (text: string) => prepared(text).plain;
 const MAPPING = /^(Column|Id|Embedded|ManyToOne|OneToMany|ManyToMany|OneToOne)$/;
 const classConst = (arg: PhpToken[]) => { const i = arg.findIndex((t, n) => t.value === '::' && arg[n + 1]?.value === 'class'); return i > 0 ? arg.slice(0, i).map(t => t.value).join('') : arg.length === 1 && arg[0].type === 'string' ? '\\' + arg[0].value.replace(/^\\/, '') : undefined; };
+const qualifiedName = (tokens: PhpToken[], i: number) => { let name = ''; let j = i; while (tokens[j] && (tokens[j].type === 'word' || tokens[j].value === '\\')) name += tokens[j++].value; return { name, next: j }; };
 
 /** Entidade declarada no arquivo (atributo `Entity` ou anotação `@ORM\Entity`), ou null. */
 export function parseEntity(text: string, file: string): Entity | null {
- if (!/\bEntity\b/.test(text)) return null;
+ const mapped = parseMapped(text, file); if (mapped?.kind !== 'entity') return null;
+ const { kind, parent, traits, source, ...entity } = mapped; void kind; void parent; void traits; void source; return entity;
+}
+/**
+ * Primeira classe ou trait do arquivo com campos mapeados por atributos `#[ORM\...]` ou anotações
+ * `@ORM\...`: `Entity`, `MappedSuperclass`, `Embeddable`; classes comuns e traits também voltam
+ * (com `extends` e `use`) porque uma entidade pode herdar delas.
+ */
+export function parseMapped(text: string, file: string): MappedClass | null {
  const tokens = phpTokens(text); const resolve = resolver(text);
  const comments = segments(text).filter(s => s.kind === 'comment');
  const docBefore = (offset: number, after: number) => comments.filter(c => c.end <= offset && c.start >= after).map(c => text.slice(c.start, c.end)).join('\n');
  type Attr = { name: string; args: PhpToken[][] };
- let pending: Attr[] = []; let entity: Entity | null = null; let depth = 0; let classDepth = -1; let boundary = 0; let awaitBody = false;
+ let pending: Attr[] = []; let entity: MappedClass | null = null; let depth = 0; let classDepth = -1; let boundary = 0; let awaitBody = false;
  for (let i = 0; i < tokens.length; i++) {
   const t = tokens[i]; const v = t.value;
   if (v === '#' && tokens[i + 1]?.value === '[') {
@@ -53,19 +65,28 @@ export function parseEntity(text: string, file: string): Entity | null {
    else if (v === '}') { if (depth === classDepth) break; depth--; }
    pending = []; boundary = t.offset + 1; continue;
   }
-  if (v === 'class' && tokens[i - 1]?.value !== '::' && tokens[i + 1]?.type === 'word' && !entity) {
+  if ((v === 'class' || v === 'trait') && tokens[i - 1]?.value !== '::' && tokens[i - 1]?.value !== 'new' && tokens[i + 1]?.type === 'word' && !entity) {
    const doc = docBefore(t.offset, 0);
+   const has = (name: string) => pending.find(a => a.name === name) ?? (new RegExp(`@(?:ORM\\\\)?${name}\\b`).test(doc) ? { name, args: [] } : undefined);
    const attr = pending.find(a => a.name === 'Entity');
    const annotation = /@(?:ORM\\)?Entity\b(?:\(([^)]*)\))?/.exec(doc);
+   const kind: MappedClass['kind'] = v === 'trait' ? 'trait' : attr || annotation ? 'entity' : has('MappedSuperclass') ? 'superclass' : has('Embeddable') ? 'embeddable' : 'class';
    pending = [];
-   if (!attr && !annotation) return null;
    const declaration = analyze(text).declarations.find(d => d.offset === tokens[i + 1].offset);
    let repository: string | undefined;
    const repoArg = attr?.args.find(a => a[0]?.value === 'repositoryClass' && a[1]?.value === ':');
    if (repoArg) repository = classConst(repoArg.slice(2));
    else if (annotation?.[1]) { const r = /repositoryClass\s*=\s*"([^"]+)"/.exec(annotation[1])?.[1]; repository = r?.includes('\\') ? '\\' + r.replace(/^\\/, '') : r; }
+   let parent: string | undefined;
+   if (tokens[i + 2]?.value === 'extends') { const q = qualifiedName(tokens, i + 3); if (q.name) parent = resolve(q.name, t.offset); }
    awaitBody = true;
-   entity = { fqcn: declaration?.fqn ?? tokens[i + 1].value, name: tokens[i + 1].value, file, ...(repository ? { repository: resolve(repository, t.offset) } : {}), fields: [], ...position(text, tokens[i + 1].offset) };
+   entity = { kind, traits: [], source: 'php', ...(parent ? { parent } : {}), fqcn: declaration?.fqn ?? tokens[i + 1].value, name: tokens[i + 1].value, file, ...(repository ? { repository: resolve(repository, t.offset) } : {}), fields: [], ...position(text, tokens[i + 1].offset) };
+   continue;
+  }
+  // `use Trait1, Trait2;` no corpo da classe.
+  if (entity && depth === classDepth && v === 'use') {
+   let j = i + 1;
+   while (j < tokens.length) { const q = qualifiedName(tokens, j); if (q.name) entity.traits.push(resolve(q.name, t.offset)); j = q.next; if (tokens[j]?.value === ',') j++; else break; }
    continue;
   }
   // Propriedade mapeada: `$nome` na profundidade da classe, fora de métodos.
@@ -82,7 +103,7 @@ export function parseEntity(text: string, file: string): Entity | null {
    if (assoc || embedded) {
     const attr = attrs.find(a => a.name === assoc || a.name === 'Embedded');
     const arg = attr?.args.find(a => /^(targetEntity|class)$/.test(a[0]?.value ?? '') && a[1]?.value === ':');
-    const annotated = /targetEntity\s*=\s*"([^"]+)"/.exec(annotations.find(a => a[1] === assoc)?.[2] ?? '')?.[1];
+    const annotated = /(?:targetEntity|class)\s*=\s*"([^"]+)"/.exec(annotations.find(a => a[1] === (assoc ?? 'Embedded'))?.[2] ?? '')?.[1];
     const raw = arg ? classConst(arg.slice(2)) : annotated?.includes('\\') ? '\\' + annotated.replace(/^\\/, '') : annotated;
     const declared = typed.at(-1);
     target = raw ? resolve(raw, t.offset) : declared && !/^(Collection|array|iterable|ArrayCollection)$/.test(declared) ? resolve(declared, t.offset) : undefined;
@@ -95,6 +116,77 @@ export function parseEntity(text: string, file: string): Entity | null {
   }
  }
  return entity;
+}
+
+/**
+ * Mapeamento XML (`*.orm.xml`, doctrine-mapping): `<entity>`, `<mapped-superclass>` e `<embeddable>`
+ * com `<id>`, `<field>`, `<embedded>` e associações; `target-entity` curto usa o namespace da entidade.
+ */
+export function parseXmlMapping(text: string, file: string): MappedClass[] {
+ const out: MappedClass[] = []; let current: MappedClass | null = null; let depth = -1;
+ const kinds: Record<string, MappedClass['kind']> = { entity: 'entity', 'mapped-superclass': 'superclass', embeddable: 'embeddable' };
+ for (const tag of xmlTags(text)) {
+  if (tag.close) { if (current && tag.depth === depth && kinds[tag.name]) current = null; continue; }
+  if (kinds[tag.name] && tag.attrs.name) {
+   const fqcn = tag.attrs.name.value.replace(/^\\/, ''); const repo = tag.attrs['repository-class']?.value.replace(/^\\/, '');
+   current = { kind: kinds[tag.name], traits: [], source: 'xml', fqcn, name: fqcn.split('\\').pop()!, file, ...(repo ? { repository: repo } : {}), fields: [], ...position(text, tag.attrs.name.offset) };
+   out.push(current); depth = tag.depth; if (tag.self) current = null; continue;
+  }
+  if (!current || tag.depth !== depth + 1) continue;
+  const ns = current.fqcn.split('\\').slice(0, -1).join('\\');
+  const qualify = (name?: string) => name ? (name.includes('\\') ? name.replace(/^\\/, '') : ns ? `${ns}\\${name}` : name) : undefined;
+  const key = tag.name === 'id' || tag.name === 'field' || tag.name === 'embedded' ? tag.attrs.name : /^(one|many)-to-(one|many)$/.test(tag.name) ? tag.attrs.field : undefined;
+  if (!key) continue;
+  const at = position(text, key.offset);
+  if (tag.name === 'id' || tag.name === 'field') current.fields.push({ name: key.value, kind: 'field', ...(tag.attrs.type ? { type: tag.attrs.type.value } : {}), offset: key.offset, ...at });
+  else if (tag.name === 'embedded') current.fields.push({ name: key.value, kind: 'embedded', ...(qualify(tag.attrs.class?.value) ? { target: qualify(tag.attrs.class?.value) } : {}), offset: key.offset, ...at });
+  else current.fields.push({ name: key.value, kind: 'association', ...(qualify(tag.attrs['target-entity']?.value) ? { target: qualify(tag.attrs['target-entity']?.value) } : {}), offset: key.offset, ...at });
+ }
+ return out;
+}
+
+/** Diretórios de mapeamento XML de config/packages/doctrine.yaml (`type: xml`, `dir:`), mais config/doctrine. */
+export function xmlMappingDirs(yaml: string | null): string[] {
+ const dirs = new Set<string>(['config/doctrine']); if (!yaml) return [...dirs];
+ const lines = yaml.split(/\r?\n/);
+ lines.forEach((line, n) => {
+  if (!/^\s*type:\s*['"]?xml['"]?\s*$/.test(line)) return;
+  const indent = /^\s*/.exec(line)![0].length;
+  for (let k = n - 1; k >= 0 && /^\s*/.exec(lines[k])![0].length >= indent; k--) { const d = /^\s*dir:\s*['"]?([^'"#]+?)['"]?\s*$/.exec(lines[k]); if (d && /^\s*/.exec(lines[k])![0].length === indent) dirs.add(d[1]); }
+  for (let k = n + 1; k < lines.length && /^\s*/.exec(lines[k])![0].length >= indent; k++) { const d = /^\s*dir:\s*['"]?([^'"#]+?)['"]?\s*$/.exec(lines[k]); if (d && /^\s*/.exec(lines[k])![0].length === indent) dirs.add(d[1]); }
+ });
+ return [...dirs].map(d => d.replace(/^%kernel\.project_dir%\/?/, '').replace(/^\.\//, '').replace(/\/$/, ''));
+}
+
+/**
+ * Campos efetivos de cada entidade: os próprios, os de traits e os herdados de superclasses
+ * mapeadas e de entidades pai (herança de tabela única/joined). Classes pai comuns não mapeiam.
+ * `lookup` resolve classes ainda não lidas (PSR-4); embeddables ficam no modelo para `a.emb.campo`.
+ */
+export async function buildModel(classes: MappedClass[], repositories: Map<string, string>, lookup: (fqcn: string) => Promise<MappedClass | null>): Promise<Model> {
+ const byName = new Map<string, MappedClass>(); const key = (n: string) => n.replace(/^\\/, '').toLowerCase();
+ // XML vence a classe PHP sem atributos com o mesmo nome; a PHP ainda informa `extends` e traits.
+ for (const c of classes) { const prev = byName.get(key(c.fqcn)); if (!prev || (prev.kind === 'class' && c.kind !== 'class')) byName.set(key(c.fqcn), prev && c.source === 'xml' ? { ...c, parent: prev.parent, traits: prev.traits } : c); else if (c.source === 'php' && prev.source === 'xml') byName.set(key(c.fqcn), { ...prev, parent: c.parent, traits: c.traits }); }
+ const find = async (fqcn: string) => { const k = key(fqcn); if (!byName.has(k)) { const c = await lookup(fqcn); if (c) byName.set(k, c); } return byName.get(k); };
+ const own = (c: MappedClass) => c.fields.map(f => ({ ...f, file: f.file ?? c.file, owner: f.owner ?? c.name }));
+ const resolved = new Map<string, EntityField[]>();
+ const fieldsOf = async (c: MappedClass, stack: string[]): Promise<EntityField[]> => {
+  const k = key(c.fqcn); const hit = resolved.get(k); if (hit) return hit; if (stack.includes(k)) return [];
+  const list = own(c);
+  for (const t of c.traits) { const trait = await find(t); if (trait) list.push(...await fieldsOf(trait, [...stack, k])); }
+  const parent = c.parent ? await find(c.parent) : undefined;
+  // Pai comum não mapeia campos, mas pode herdar de uma superclasse mapeada mais acima.
+  if (parent) { const inherited = await fieldsOf(parent, [...stack, k]); list.push(...(parent.kind === 'class' ? inherited.filter(f => f.owner !== parent.name) : inherited)); }
+  const seen = new Set<string>(); const out = list.filter(f => !seen.has(f.name) && seen.add(f.name));
+  resolved.set(k, out); return out;
+ };
+ const entities: Entity[] = []; const embeddables: Entity[] = [];
+ for (const c of [...byName.values()]) {
+  if (c.kind !== 'entity' && c.kind !== 'embeddable') continue;
+  const { kind, parent, traits, source, ...rest } = c; void parent; void traits; void source;
+  (kind === 'entity' ? entities : embeddables).push({ ...rest, fields: await fieldsOf(c, []) });
+ }
+ return { entities, repositories, embeddables };
 }
 function argumentsAt(tokens: PhpToken[], open: number) {
  const args: PhpToken[][] = [[]]; let depth = 0; let i = open + 1;
@@ -114,8 +206,9 @@ export function repositoryEntity(text: string): { repository: string; entity: st
  return declaration ? { repository: declaration.fqn, entity: resolve(m[1], m.index) } : null;
 }
 
-export type Model = { entities: Entity[]; repositories: Map<string, string> };
+export type Model = { entities: Entity[]; repositories: Map<string, string>; embeddables?: Entity[] };
 export const entityByName = (model: Model, name: string) => { const n = name.replace(/^\\/, '').toLowerCase(); return model.entities.find(e => e.fqcn.toLowerCase() === n) ?? model.entities.find(e => e.name.toLowerCase() === n || `${e.fqcn.split('\\')[0]}:${e.name}`.toLowerCase() === n); };
+export const embeddableByName = (model: Model, name: string) => { const n = name.replace(/^\\/, '').toLowerCase(); return model.embeddables?.find(e => e.fqcn.toLowerCase() === n); };
 const repositoryTarget = (model: Model, repo: string) => { const fqcn = model.repositories.get(repo.toLowerCase()) ?? model.entities.find(e => e.repository?.toLowerCase() === repo.toLowerCase())?.fqcn; return fqcn ? entityByName(model, fqcn) : undefined; };
 
 /** Contexto Doctrine/Form de uma string PHP: quais nomes valem ali e qual trecho o cursor edita. */
@@ -179,8 +272,13 @@ export function doctrineContext(model: Model, text: string, offset: number, form
  const call = callSite(code, literal.start);
  if (call && (QB.has(call.callee) || call.callee === '->createQuery')) {
   const aliases = call.callee === '->createQuery' ? dqlAliases(model, value) : queryAliases(model, text, offset);
-  const dotted = wordAt(/(\w+)\.(\w*)$/);
-  if (dotted) { const entity = aliases.get(dotted.left[1]); return entity ? { kind: 'alias-field', entity, alias: dotted.left[1], from: dotted.from, to: dotted.to, word: dotted.left[2] + text.slice(offset, dotted.to), literal } : null; }
+  const dotted = wordAt(/(\w+)((?:\.\w+)*)\.(\w*)$/);
+  if (dotted) {
+   // `a.embutido.campo`: cada passo intermediário precisa ser um embedded.
+   let entity = aliases.get(dotted.left[1]);
+   for (const part of dotted.left[2].split('.').filter(Boolean)) { const f = entity?.fields.find(x => x.name === part && x.kind === 'embedded'); entity = f?.target ? embeddableByName(model, f.target) : undefined; }
+   return entity ? { kind: 'alias-field', entity, alias: dotted.left[1], from: dotted.from, to: dotted.to, word: dotted.left[3] + text.slice(offset, dotted.to), literal } : null;
+  }
   if (call.callee === '->createQuery') { const from = wordAt(/\b(?:FROM|JOIN)\s+([\w\\:]*)$/i); if (from) return { kind: 'entity', from: from.from, to: from.to, word: from.left[1], literal }; }
   const plain = wordAt(/(?:^|[\s(,=<>!])(\w*)$/);
   return plain && aliases.size ? { kind: 'aliases', aliases, from: plain.from, to: plain.to, word: plain.left[1], literal } : null;

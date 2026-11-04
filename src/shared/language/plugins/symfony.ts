@@ -3,7 +3,7 @@ import { CompletionKind, type CodeCompletion, type CodeSite, type IdePlugin, typ
 import type { PluginFix } from './extensions';
 import { maskEnv, readEnv, type EnvEntry } from '../../env-document';
 import { bundleTemplates, classFile, compiledContainer, parseBundles, parseContainerXml, parseXmlRoutes, psr4, type Bundle } from './symfony-config';
-import { doctrineContext, entityByName, formOptions, formTranslationOption, nearest, parseEntity, repositoryEntity, type Entity, type Model } from './doctrine';
+import { buildModel, doctrineContext, entityByName, formOptions, formTranslationOption, nearest, parseMapped, parseXmlMapping, repositoryEntity, xmlMappingDirs, type Entity, type MappedClass, type Model } from './doctrine';
 import { compiledRoutesFile, parseCompiledRoutes, parsePhpRouting, parseXmlImports, parseYamlImports, prefixPath, type RouteImport } from './routing';
 import { loadCatalog, phpTransSite, phpTransSites, twigTransSite, twigTransSites, type Catalog, type TransSite } from './translations';
 
@@ -259,16 +259,22 @@ export class SymfonyPlugin implements IdePlugin {
  }
  private allModel(files: ProjectFiles) {
   return this.model ??= (async () => {
-   const entities: Entity[] = []; const repositories = new Map<string, string>();
+   const classes: MappedClass[] = []; const repositories = new Map<string, string>();
    // Mapeamento padrão do DoctrineBundle (src/Entity) e repositórios; projetos fora do padrão: todo o src/.
    let paths = [...await files.list('src/Entity', n => n.endsWith('.php')), ...await files.list('src/Repository', n => n.endsWith('.php'))];
    if (!paths.length) paths = await files.list('src', n => n.endsWith('.php'));
    for (const p of paths) {
     const text = await files.read(p); if (!text) continue;
-    const entity = /Entity/.test(text) ? parseEntity(text, p) : null; if (entity) entities.push(entity);
+    const mapped = /ORM|Entity|Embeddable|MappedSuperclass/.test(text) || p.startsWith('src/Entity/') ? parseMapped(text, p) : null; if (mapped) classes.push(mapped);
     const repo = /EntityRepository/.test(text) ? repositoryEntity(text) : null; if (repo) repositories.set(repo.repository.toLowerCase(), repo.entity);
    }
-   return { entities, repositories };
+   // Mapeamento XML: diretórios do doctrine.yaml (type: xml) e config/doctrine.
+   for (const dir of xmlMappingDirs(await files.read('config/packages/doctrine.yaml'))) for (const p of await files.list(dir, n => n.endsWith('.orm.xml'))) classes.push(...parseXmlMapping((await files.read(p)) ?? '', p));
+   // Classes pai, traits e classes mapeadas por XML fora de src/Entity: pelo PSR-4.
+   const map = await psr4(files);
+   const lookup = async (fqcn: string) => { const file = await classFile(fqcn, map, files); const text = file ? await files.read(file) : null; return text ? parseMapped(text, file!) : null; };
+   for (const c of classes.filter(c => c.source === 'xml')) if (!classes.some(o => o.source === 'php' && o.fqcn === c.fqcn)) { const php = await lookup(c.fqcn); if (php) classes.push(php); }
+   return buildModel(classes, repositories, lookup);
   })();
  }
  private allCatalog(files: ProjectFiles) { return this.catalog ??= loadCatalog(files); }
@@ -427,7 +433,7 @@ export class SymfonyPlugin implements IdePlugin {
  }
  // ── Doctrine e forms ───────────────────────────────────────────────────────────────────────
  private fieldItems(entity: Entity): PluginCompletion[] {
-  return entity.fields.map(f => ({ label: f.name, kind: f.kind === 'association' ? CompletionKind.Reference : CompletionKind.Field, labelDetails: { description: f.target?.split('\\').pop() ?? f.type ?? '' }, detail: `${entity.name}::$${f.name}` }));
+  return entity.fields.map(f => ({ label: f.name, kind: f.kind === 'association' ? CompletionKind.Reference : CompletionKind.Field, labelDetails: { description: f.target?.split('\\').pop() ?? f.type ?? '' }, detail: `${f.owner ?? entity.name}::$${f.name}${f.file?.endsWith('.xml') ? ` · ${f.file}` : ''}` }));
  }
  private async completePhp(site: CodeSite, files: ProjectFiles): Promise<CodeCompletion | null> {
   const option = formTranslationOption(site.text, site.offset);
@@ -447,7 +453,7 @@ export class SymfonyPlugin implements IdePlugin {
   const at = (file: string, line: number, character: number, length: number) => [{ uri: files.uri(file), range: { start: { line, character }, end: { line, character: character + length } } }];
   if (context.kind === 'fields' || context.kind === 'alias-field') {
    const word = context.kind === 'fields' ? context.word : site.text.slice(context.from, context.to);
-   const field = context.entity.fields.find(f => f.name === word); return field ? at(context.entity.file, field.line, field.character, field.name.length + 1) : [];
+   const field = context.entity.fields.find(f => f.name === word); return field ? at(field.file ?? context.entity.file, field.line, field.character, field.name.length + (field.file?.endsWith('.xml') ? 0 : 1)) : [];
   }
   if (context.kind === 'entity') { const e = entityByName(model, site.text.slice(context.from, context.to)); return e ? at(e.file, e.line, e.character, e.name.length) : []; }
   if (context.kind === 'aliases') { const e = context.aliases.get(site.text.slice(context.from, context.to)); return e ? at(e.file, e.line, e.character, e.name.length) : []; }
@@ -485,9 +491,15 @@ export class SymfonyPlugin implements IdePlugin {
    };
    if (probe.kind === 'fields' && probe.source === 'findBy') report(probe.entity, value, segment.start + 1);
    else if (probe.kind === 'alias-field' || probe.kind === 'aliases') {
-    for (const m of value.matchAll(/(?<![\w.:])(\w+)\.(\w+)\b/g)) {
-     const ctx = doctrineContext(model, text, segment.start + 1 + m.index! + m[1].length + 1);
-     if (ctx?.kind === 'alias-field') report(ctx.entity, m[2], segment.start + 1 + m.index! + m[1].length + 1);
+    for (const m of value.matchAll(/(?<![\w.:])(\w+)((?:\.\w+)+)/g)) {
+     // Cada parte de `a.embutido.campo` é conferida na classe do passo anterior.
+     let at = segment.start + 1 + m.index! + m[1].length;
+     for (const part of m[2].slice(1).split('.')) {
+      at += 1; const ctx = doctrineContext(model, text, at);
+      if (ctx?.kind !== 'alias-field') break;
+      if (!ctx.entity.fields.some(f => f.name === part)) { report(ctx.entity, part, at); break; }
+      at += part.length;
+     }
     }
    }
   }

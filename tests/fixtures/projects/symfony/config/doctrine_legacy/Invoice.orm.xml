@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<doctrine-mapping xmlns="http://doctrine-project.org/schemas/orm/doctrine-mapping">
+    <entity name="App\Legacy\Invoice" repository-class="App\Legacy\InvoiceRepository">
+        <id name="number" type="string"/>
+        <many-to-one field="customer" target-entity="App\Entity\User"/>
+    </entity>
+</doctrine-mapping>
