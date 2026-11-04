@@ -4,6 +4,7 @@ import type { PluginFix } from './extensions';
 import { maskEnv, readEnv, type EnvEntry } from '../../env-document';
 import { bundleTemplates, classFile, compiledContainer, parseBundles, parseContainerXml, parsePhpRoutes, parseXmlRoutes, psr4, type Bundle } from './symfony-config';
 import { doctrineContext, entityByName, nearest, parseEntity, repositoryEntity, type Entity, type Model } from './doctrine';
+import { loadCatalog, phpTransSite, phpTransSites, twigTransSite, twigTransSites, type Catalog, type TransSite } from './translations';
 
 // Symfony (symfony.com/doc): rotas por atributo `#[Route]` e YAML, templates Twig,
 // serviços e parâmetros de config/*.yaml e `%env()%` ligado aos arquivos .env.
@@ -147,6 +148,7 @@ export class SymfonyPlugin implements IdePlugin {
  private env?: Promise<Map<string, EnvEntry>>;
  private bundles?: Promise<(Bundle & { file: string | null })[]>;
  private model?: Promise<Model>;
+ private catalog?: Promise<Catalog>;
  async detect(files: ProjectFiles) {
   const composer = await files.read('composer.json'); if (!composer) return null;
   let json: any; try { json = JSON.parse(composer); } catch { return null; }
@@ -158,8 +160,8 @@ export class SymfonyPlugin implements IdePlugin {
   return { version: version ? `${version[1]}.${version[2]}` : undefined };
  }
  documents(path: string) { return path.endsWith('.php') || (path.startsWith('templates/') && path.endsWith('.twig')) || (path.startsWith('config/') && /\.ya?ml$/.test(path)); }
- invalidates(path: string) { return /^(src|config|templates)\//.test(path) || /^\.env(\.|$)/.test(path) || /^var\/cache\/[^/]+\/\w+Container\.xml$/.test(path) || path === 'vendor/composer/installed.json' || path === 'composer.json'; }
- invalidate() { this.routes = this.templates = this.container = this.env = this.bundles = this.model = undefined; }
+ invalidates(path: string) { return /^(src|config|templates|translations)\//.test(path) || /^\.env(\.|$)/.test(path) || /^var\/cache\/[^/]+\/\w+Container\.xml$/.test(path) || path === 'vendor/composer/installed.json' || path === 'composer.json'; }
+ invalidate() { this.routes = this.templates = this.container = this.env = this.bundles = this.model = this.catalog = undefined; }
  private allRoutes(files: ProjectFiles) {
   return this.routes ??= (async () => {
    const out: SymfonyRoute[] = [];
@@ -205,6 +207,7 @@ export class SymfonyPlugin implements IdePlugin {
    return { entities, repositories };
   })();
  }
+ private allCatalog(files: ProjectFiles) { return this.catalog ??= loadCatalog(files); }
  private allContainer(files: ProjectFiles) {
   return this.container ??= (async () => {
    const services: YamlKey[] = []; const parameters: YamlKey[] = [];
@@ -264,7 +267,13 @@ export class SymfonyPlugin implements IdePlugin {
  }
 
  async completeString(site: StringSite, files: ProjectFiles) {
-  const kind = this.kind(site); if (!kind) return null;
+  const kind = this.kind(site);
+  if (!kind) {
+   // Chave de tradução ocupa a string inteira.
+   const trans = phpTransSite(site.text, site.literal.start + 1);
+   if (trans) return this.messages(trans.domain, files);
+   return null;
+  }
   if (kind !== 'reference') return this.candidates(kind, files);
   const ref = referenceAt(site.prefix); if (!ref) return null;
   // O item substitui a string inteira; o prefixo (`%env(`, `%`, `@`) é recomposto.
@@ -305,6 +314,8 @@ export class SymfonyPlugin implements IdePlugin {
   const before = site.text.slice(Math.max(0, site.offset - 300), site.offset).split('\n').pop()!;
   if (site.path.endsWith('.php')) return this.completePhp(site, files);
   if (site.path.endsWith('.twig')) {
+   const trans = twigTransSite(site.text, site.offset);
+   if (trans) return { from: trans.from, to: trans.to, items: await this.messages(trans.domain, files) };
    const context = this.twigContext(before); if (!context) return null;
    return { from: site.offset - context.word.length, items: await this.candidates(context.kind, files) };
   }
@@ -320,6 +331,8 @@ export class SymfonyPlugin implements IdePlugin {
   const { line, col } = this.lineAround(site);
   if (site.path.endsWith('.php')) return this.definePhp(site, files);
   if (site.path.endsWith('.twig')) {
+   const trans = twigTransSite(site.text, site.offset);
+   if (trans) return this.messageLocations(trans, files);
    for (const m of line.matchAll(/(['"])([^'"]*)\1/g)) {
     if (col <= m.index! || col >= m.index! + m[0].length) continue;
     const context = this.twigContext(line.slice(0, m.index! + 1)); if (!context) return null;
@@ -332,7 +345,20 @@ export class SymfonyPlugin implements IdePlugin {
   return found ? this.locate(found.kind, found.word, files) : null;
  }
 
-
+ // ── Traduções ──────────────────────────────────────────────────────────────────────────────
+ private async messages(domain: string, files: ProjectFiles): Promise<PluginCompletion[]> {
+  const catalog = await this.allCatalog(files); const keys = new Map<string, { value: string; locales: Set<string> }>();
+  for (const m of catalog.messages) {
+   if (m.domain !== domain) continue;
+   const entry = keys.get(m.key) ?? { value: '', locales: new Set<string>() }; entry.locales.add(m.locale);
+   if (m.locale === catalog.defaultLocale || !entry.value) entry.value = m.value; keys.set(m.key, entry);
+  }
+  return [...keys].sort(([a], [b]) => a.localeCompare(b)).map(([key, e]) => ({ label: key, kind: CompletionKind.Text, labelDetails: { description: e.value }, detail: `${domain} · ${[...e.locales].sort().join(', ')}` }));
+ }
+ private async messageLocations(site: TransSite, files: ProjectFiles): Promise<PluginLocation[]> {
+  return (await this.allCatalog(files)).messages.filter(m => m.domain === site.domain && m.key === site.key)
+   .map(m => ({ uri: files.uri(m.file), range: { start: { line: m.line, character: m.character }, end: { line: m.line, character: m.character + m.length } } }));
+ }
  // ── Doctrine e forms ───────────────────────────────────────────────────────────────────────
  private fieldItems(entity: Entity): PluginCompletion[] {
   return entity.fields.map(f => ({ label: f.name, kind: f.kind === 'association' ? CompletionKind.Reference : CompletionKind.Field, labelDetails: { description: f.target?.split('\\').pop() ?? f.type ?? '' }, detail: `${entity.name}::$${f.name}` }));
@@ -346,6 +372,8 @@ export class SymfonyPlugin implements IdePlugin {
   return null;
  }
  private async definePhp(site: CodeSite, files: ProjectFiles): Promise<PluginLocation[] | null> {
+  const trans = phpTransSite(site.text, site.offset);
+  if (trans) return this.messageLocations(trans, files);
   const model = await this.allModel(files); const context = doctrineContext(model, site.text, site.offset, false); if (!context) return null;
   const at = (file: string, line: number, character: number, length: number) => [{ uri: files.uri(file), range: { start: { line, character }, end: { line, character: character + length } } }];
   if (context.kind === 'fields' || context.kind === 'alias-field') {
@@ -361,6 +389,13 @@ export class SymfonyPlugin implements IdePlugin {
  async diagnose(path: string, text: string, files: ProjectFiles): Promise<PluginDiagnostic[]> {
   const out: (PluginDiagnostic & { fixes?: PluginFix[] })[] = [];
   const range = (from: number, to: number) => ({ start: position(text, from), end: position(text, to) });
+  const catalog = await this.allCatalog(files);
+  const sites = path.endsWith('.twig') ? twigTransSites(text) : path.endsWith('.php') ? phpTransSites(text) : [];
+  for (const site of sites) {
+   if (!catalog.domains.has(site.domain) || catalog.messages.some(m => m.domain === site.domain && m.key === site.key)) continue;
+   const fix = await this.createKeyFix(site, catalog, files);
+   out.push({ range: range(site.from, site.to), message: `Chave de tradução '${site.key}' não existe no domínio '${site.domain}'.`, code: 'symfony.translation.missing', severity: 'warning', ...(fix ? { fixes: [fix] } : {}) });
+  }
   if (!path.endsWith('.php')) return out;
   if (path === 'config/bundles.php') for (const b of await this.allBundles(files)) {
    if (!b.file) out.push({ range: { start: { line: b.line, character: b.character }, end: { line: b.line, character: b.character + b.length } }, message: `Bundle ${b.fqcn} não encontrado pelo autoload (composer.json/vendor). Rode composer install ou corrija o nome.`, code: 'symfony.bundle.missing', severity: 'error' });
@@ -388,5 +423,13 @@ export class SymfonyPlugin implements IdePlugin {
    }
   }
   return out;
+ }
+ /** Correção "Criar chave": acrescenta `'chave': 'chave'` ao catálogo YAML do locale padrão. */
+ private async createKeyFix(site: TransSite, catalog: Catalog, files: ProjectFiles): Promise<PluginFix | null> {
+  const file = [`translations/${site.domain}.${catalog.defaultLocale}.yaml`, `translations/${site.domain}+intl-icu.${catalog.defaultLocale}.yaml`].find(f => catalog.messages.some(m => m.file === f));
+  if (!file) return null;
+  const content = (await files.read(file)) ?? ''; const end = position(content, content.length);
+  const quoted = `'${site.key.replace(/'/g, "''")}'`;
+  return { title: `Criar a chave '${site.key}' em ${file}`, edits: [{ uri: files.uri(file), range: { start: end, end }, newText: `${content && !content.endsWith('\n') ? '\n' : ''}${quoted}: ${quoted}\n` }] };
  }
 }

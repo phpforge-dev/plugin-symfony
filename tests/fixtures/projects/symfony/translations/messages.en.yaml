@@ -1,0 +1,6 @@
+admin:
+    title: 'Administration'
+post:
+    title: Title
+    body: 'Body'
+'flat.key': Flat

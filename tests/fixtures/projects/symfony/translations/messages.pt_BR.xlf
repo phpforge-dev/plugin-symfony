@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<xliff xmlns="urn:oasis:names:tc:xliff:document:1.2" version="1.2">
+  <file source-language="en" target-language="pt_BR" datatype="plaintext" original="file.ext">
+    <body>
+      <trans-unit id="a1" resname="admin.title">
+        <source>admin.title</source>
+        <target>Administração</target>
+      </trans-unit>
+      <trans-unit id="post.only_pt">
+        <source>post.only_pt</source>
+        <target>Só em português</target>
+      </trans-unit>
+    </body>
+  </file>
+</xliff>
