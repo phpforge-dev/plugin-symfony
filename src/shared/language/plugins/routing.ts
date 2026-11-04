@@ -1,6 +1,7 @@
 import { phpTokens, position, type PhpToken } from '../php-source';
 import { callArguments, xmlTags, type Route } from './symfony-config';
 import type { ProjectFiles } from './api';
+import { listIn } from './list';
 
 // Carregamento de rotas como o Routing do Symfony (symfony.com/doc/current/routing.html):
 // coleções do RoutingConfigurator (`$routes->collection('blog_')->prefix('/blog')`), imports com
@@ -155,6 +156,6 @@ export function parseCompiledRoutes(text: string, file: string): CompiledRoute[]
 }
 /** Gerador compilado `var/cache/<env>/url_generating_routes.php`, preferindo o ambiente dev. */
 export async function compiledRoutesFile(files: ProjectFiles): Promise<string | null> {
- const list = (await files.list('var/cache', n => n === 'url_generating_routes.php')).filter(p => /^var\/cache\/[^/]+\/url_generating_routes\.php$/.test(p));
+ const list = (await listIn(files, 'var/cache', n => n === 'url_generating_routes.php')).filter(p => /^var\/cache\/[^/]+\/url_generating_routes\.php$/.test(p));
  return list.sort((a, b) => Number(!a.includes('/dev/')) - Number(!b.includes('/dev/')) || a.localeCompare(b))[0] ?? null;
 }

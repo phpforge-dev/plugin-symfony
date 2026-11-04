@@ -6,6 +6,7 @@ import { bundleTemplates, classFile, compiledContainer, parseBundles, parseConta
 import { buildModel, doctrineContext, entityByName, formOptions, formTranslationOption, nearest, parseMapped, parseXmlMapping, repositoryEntity, xmlMappingDirs, type Entity, type MappedClass, type Model } from './doctrine';
 import { compiledRoutesFile, parseCompiledRoutes, parsePhpRouting, parseXmlImports, parseYamlImports, prefixPath, type RouteImport } from './routing';
 import { loadCatalog, phpTransSite, phpTransSites, twigTransSite, twigTransSites, type Catalog, type TransSite } from './translations';
+import { listIn } from './list';
 
 // Symfony (symfony.com/doc): rotas por atributo `#[Route]`, YAML, PHP e XML, templates Twig
 // (inclusive `@Bundle/` de config/bundles.php), serviços e parâmetros de config/*.yaml e do
@@ -154,7 +155,7 @@ type Target = { file: string; attribute: boolean };
  * Rotas só do gerador compilado (bundles, `_wdt`…) completam a lista.
  */
 export async function loadRoutes(files: ProjectFiles, bundles: () => Promise<(Bundle & { file: string | null })[]>): Promise<SymfonyRoute[]> {
- const configs = (await files.list('config', n => /\.(ya?ml|php|xml)$/.test(n))).filter(isRouteConfig).sort();
+ const configs = (await listIn(files, 'config', n => /\.(ya?ml|php|xml)$/.test(n))).filter(isRouteConfig).sort();
  const cache = new Map<string, { routes: SymfonyRoute[]; imports: RouteImport[] }>();
  const parse = async (file: string, attribute: boolean) => {
   const key = `${attribute}:${file}`; const hit = cache.get(key); if (hit) return hit;
@@ -174,11 +175,11 @@ export async function loadRoutes(files: ProjectFiles, bundles: () => Promise<(Bu
   if (path.includes('*') || path.includes('{')) {
    const base = path.slice(0, path.search(/[*{]/)).replace(/\/[^/]*$/, '');
    const re = new RegExp('^' + path.replace(/[.+^$()|[\]\\]/g, '\\$&').replace(/\{([^}]*)\}/g, (_, a: string) => `(${a.split(',').join('|')})`).replace(/\*\*\//g, '(?:.*/)?').replace(/\*/g, '[^/]*') + '$');
-   return (await files.list(base, () => true)).filter(f => re.test(f)).sort().map(file => ({ file, attribute: attribute || (file.endsWith('.php') && !file.startsWith('config/')) }));
+   return (await listIn(files, base, () => true)).filter(f => re.test(f)).sort().map(file => ({ file, attribute: attribute || (file.endsWith('.php') && !file.startsWith('config/')) }));
   }
   if (/\.(ya?ml|xml|php)$/.test(path)) return await files.exists(path) ? [{ file: path, attribute: attribute || (path.endsWith('.php') && !path.startsWith('config/')) }] : [];
   // Diretório: controllers (atributos) ou arquivos de configuração de rotas.
-  const list = (await files.list(path.replace(/\/$/, ''), n => /\.(php|ya?ml|xml)$/.test(n))).sort();
+  const list = (await listIn(files, path.replace(/\/$/, ''), n => /\.(php|ya?ml|xml)$/.test(n))).sort();
   return attribute || !path.startsWith('config') ? list.filter(f => f.endsWith('.php')).map(file => ({ file, attribute: true })) : list.map(file => ({ file, attribute: false }));
  };
  // Arquivos alcançados por algum import deixam de ser raízes.
@@ -197,7 +198,7 @@ export async function loadRoutes(files: ProjectFiles, bundles: () => Promise<(Bu
   }
  };
  for (const file of configs) if (!imported.has(`false:${file}`)) await visit({ file, attribute: false }, '', '', true, []);
- for (const file of (await files.list('src', n => n.endsWith('.php'))).sort()) if (!reached.has(`true:${file}`)) await visit({ file, attribute: true }, '', '', true, []);
+ for (const file of (await listIn(files, 'src', n => n.endsWith('.php'))).sort()) if (!reached.has(`true:${file}`)) await visit({ file, attribute: true }, '', '', true, []);
  // Gerador compilado: completa com o que a configuração não declara (rotas de bundles).
  const compiled = await compiledRoutesFile(files);
  if (compiled) {
@@ -242,7 +243,7 @@ export class SymfonyPlugin implements IdePlugin {
  private allTemplates(files: ProjectFiles) {
   return this.templates ??= (async () => {
    const map = new Map<string, string>();
-   for (const p of (await files.list('templates', n => n.endsWith('.twig'))).sort()) map.set(p.slice('templates/'.length), p);
+   for (const p of (await listIn(files, 'templates', n => n.endsWith('.twig'))).sort()) map.set(p.slice('templates/'.length), p);
    for (const b of await this.allBundles(files)) {
     const found = b.file ? await bundleTemplates(b.file, files) : null;
     for (const t of found?.templates ?? []) map.set(`@${b.alias}/${t}`, `${found!.dir}/${t}`);
@@ -261,15 +262,15 @@ export class SymfonyPlugin implements IdePlugin {
   return this.model ??= (async () => {
    const classes: MappedClass[] = []; const repositories = new Map<string, string>();
    // Mapeamento padrão do DoctrineBundle (src/Entity) e repositórios; projetos fora do padrão: todo o src/.
-   let paths = [...await files.list('src/Entity', n => n.endsWith('.php')), ...await files.list('src/Repository', n => n.endsWith('.php'))];
-   if (!paths.length) paths = await files.list('src', n => n.endsWith('.php'));
+   let paths = [...await listIn(files, 'src/Entity', n => n.endsWith('.php')), ...await listIn(files, 'src/Repository', n => n.endsWith('.php'))];
+   if (!paths.length) paths = await listIn(files, 'src', n => n.endsWith('.php'));
    for (const p of paths) {
     const text = await files.read(p); if (!text) continue;
     const mapped = /ORM|Entity|Embeddable|MappedSuperclass/.test(text) || p.startsWith('src/Entity/') ? parseMapped(text, p) : null; if (mapped) classes.push(mapped);
     const repo = /EntityRepository/.test(text) ? repositoryEntity(text) : null; if (repo) repositories.set(repo.repository.toLowerCase(), repo.entity);
    }
    // Mapeamento XML: diretórios do doctrine.yaml (type: xml) e config/doctrine.
-   for (const dir of xmlMappingDirs(await files.read('config/packages/doctrine.yaml'))) for (const p of await files.list(dir, n => n.endsWith('.orm.xml'))) classes.push(...parseXmlMapping((await files.read(p)) ?? '', p));
+   for (const dir of xmlMappingDirs(await files.read('config/packages/doctrine.yaml'))) for (const p of await listIn(files, dir, n => n.endsWith('.orm.xml'))) classes.push(...parseXmlMapping((await files.read(p)) ?? '', p));
    // Classes pai, traits e classes mapeadas por XML fora de src/Entity: pelo PSR-4.
    const map = await psr4(files);
    const lookup = async (fqcn: string) => { const file = await classFile(fqcn, map, files); const text = file ? await files.read(file) : null; return text ? parseMapped(text, file!) : null; };
@@ -281,7 +282,7 @@ export class SymfonyPlugin implements IdePlugin {
  private allContainer(files: ProjectFiles) {
   return this.container ??= (async () => {
    const services: YamlKey[] = []; const parameters: YamlKey[] = [];
-   for (const p of await files.list('config', n => /\.ya?ml$/.test(n))) {
+   for (const p of await listIn(files, 'config', n => /\.ya?ml$/.test(n))) {
     if (/^config\/routes/.test(p)) continue;
     const parsed = parseServices((await files.read(p)) ?? '', p); services.push(...parsed.services); parameters.push(...parsed.parameters);
    }

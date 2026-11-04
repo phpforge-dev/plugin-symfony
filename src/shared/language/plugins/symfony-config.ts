@@ -1,5 +1,6 @@
 import { phpTokens, position, type PhpToken } from '../php-source';
 import type { ProjectFiles } from './api';
+import { listIn } from './list';
 
 // Fontes de configuração do Symfony além de atributos/YAML (symfony.com/doc): rotas em PHP
 // (RoutingConfigurator) e XML, config/bundles.php, autoload PSR-4 do Composer para achar o
@@ -67,7 +68,7 @@ export function parseContainerXml(text: string, file: string): { services: Defin
 }
 /** Container compilado: `var/cache/<env>/<Kernel>Container.xml`, preferindo o ambiente dev. */
 export async function compiledContainer(files: ProjectFiles): Promise<string | null> {
- const list = (await files.list('var/cache', n => /Container\.xml$/.test(n))).filter(p => /^var\/cache\/[^/]+\/\w+Container\.xml$/.test(p));
+ const list = (await listIn(files, 'var/cache', n => /Container\.xml$/.test(n))).filter(p => /^var\/cache\/[^/]+\/\w+Container\.xml$/.test(p));
  return list.sort((a, b) => Number(!a.includes('/dev/')) - Number(!b.includes('/dev/')) || a.localeCompare(b))[0] ?? null;
 }
 
@@ -126,7 +127,7 @@ export async function classFile(fqcn: string, map: { prefix: string; dir: string
 export async function bundleTemplates(classPath: string, files: ProjectFiles): Promise<{ dir: string; templates: string[] } | null> {
  const dir = classPath.split('/').slice(0, -1).join('/');
  for (const candidate of [`${dir}/Resources/views`, normalize(`${dir}/../templates`), `${dir}/templates`]) {
-  const templates = await files.list(candidate, n => n.endsWith('.twig'));
+  const templates = await listIn(files, candidate, n => n.endsWith('.twig'));
   if (templates.length) return { dir: candidate, templates: templates.map(t => t.slice(candidate.length + 1)).sort() };
  }
  return null;

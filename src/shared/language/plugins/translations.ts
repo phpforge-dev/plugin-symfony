@@ -3,6 +3,7 @@ import type { ProjectFiles } from './api';
 import { callSite } from './host';
 import { literalIn, prepared } from './prepared';
 import { xmlTags, xmlText } from './symfony-config';
+import { listIn } from './list';
 
 // Traduções do Symfony (symfony.com/doc/current/translation.html): catálogos
 // `translations/<domínio>[+intl-icu].<locale>.(yaml|xlf|php|json)`, `->trans()`, `t()`,
@@ -79,7 +80,7 @@ export function jsonMessages(text: string) {
 export type Catalog = { messages: Message[]; domains: Set<string>; defaultLocale: string };
 export async function loadCatalog(files: ProjectFiles): Promise<Catalog> {
  const messages: Message[] = []; const domains = new Set<string>();
- for (const file of await files.list('translations', n => FILE.test(n))) {
+ for (const file of await listIn(files, 'translations', n => FILE.test(n))) {
   const m = FILE.exec(file.split('/').pop()!)!; const text = (await files.read(file)) ?? '';
   const [domain, locale, ext] = [m[1], m[3], m[4]]; domains.add(domain);
   const list = /ya?ml/.test(ext) ? yamlMessages(text) : /xl/.test(ext) ? xliffMessages(text) : ext === 'php' ? phpMessages(text) : jsonMessages(text);
