@@ -10,4 +10,5 @@
         </route>
     </when>
     <import resource="../../src/Controller/" type="attribute"/>
+    <import resource="legacy/old.xml" prefix="/old" name-prefix="old_"/>
 </routes>

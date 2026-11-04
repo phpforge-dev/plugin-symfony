@@ -1,0 +1,6 @@
+catalog_index:
+    path: /
+    methods: [GET]
+
+catalog_item:
+    path: /item/{sku}

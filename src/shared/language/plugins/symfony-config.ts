@@ -86,26 +86,6 @@ export function callArguments(tokens: PhpToken[], open: number) {
 }
 const single = (arg: PhpToken[] | undefined) => arg?.length === 1 && arg[0].type === 'string' ? arg[0] : undefined;
 
-/** `$routes->add('nome', '/caminho')->methods([...])` de config/routes*.php (RoutingConfigurator). */
-export function parsePhpRoutes(text: string, file: string): Route[] {
- const tokens = phpTokens(text); const out: Route[] = [];
- for (let i = 0; i < tokens.length; i++) {
-  if (tokens[i].value !== 'add' || tokens[i - 1]?.value !== '->' || tokens[i + 1]?.value !== '(') continue;
-  const { args, close } = callArguments(tokens, i + 1);
-  const name = single(args[0]); if (!name) continue;
-  const path = single(args[1]) ?? args[1]?.find(t => t.type === 'string');
-  let methods: string[] = [];
-  for (let j = close + 1, depth = 0; j < tokens.length; j++) {
-   const v = tokens[j].value;
-   if (v === '(' || v === '[') depth++; else if (v === ')' || v === ']') depth--;
-   if (depth < 0 || (v === ';' && depth === 0)) break;
-   if (v === 'methods' && tokens[j - 1]?.value === '->' && tokens[j + 1]?.value === '(') methods = callArguments(tokens, j + 1).args.flat().filter(t => t.type === 'string').map(t => t.value.toUpperCase());
-  }
-  out.push({ name: name.value, path: path?.value ?? '', methods: methods.join('|') || 'ANY', file, ...position(text, name.offset + 1), length: name.value.length });
- }
- return out;
-}
-
 export type Bundle = { fqcn: string; name: string; alias: string; envs: string[]; line: number; character: number; length: number };
 /** `Classe::class => ['all' => true]` de config/bundles.php; `alias` é o namespace Twig (`@AcmeDemo`). */
 export function parseBundles(text: string): Bundle[] {

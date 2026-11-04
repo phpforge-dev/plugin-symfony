@@ -42,7 +42,8 @@ test('rotas por atributo: prefixo da classe, métodos, FQCN e nome automático',
 });
 
 test('rotas YAML: ignora imports, entra em when@env', () => {
- assert.deepEqual(parseYamlRoutes(read('config/routes.yaml'), 'config/routes.yaml').map(r => [r.name, r.path, r.methods, r.line]), [['homepage', '/', 'GET', 6], ['debug_page', '/_debug', 'ANY', 15]]);
+ const yaml = read('config/routes.yaml');
+ assert.deepEqual(parseYamlRoutes(yaml, 'config/routes.yaml').map(r => [r.name, r.path, r.methods, r.line]), [['homepage', '/', 'GET', line(yaml, 'homepage:')], ['debug_page', '/_debug', 'ANY', line(yaml, 'debug_page:')]]);
 });
 
 test('serviços e parâmetros de config/*.yaml', () => {
@@ -63,8 +64,8 @@ test('PHP: completion e navegação de rotas, templates, parâmetros e Autowire'
  const h = host();
  const routeSite = at(controller, "redirectToRoute('");
  const routes = await h.complete('src/Controller/BlogController.php', controller, routeSite);
- assert.deepEqual(routes!.items.map(i => i.label), ['admin_dashboard', 'admin_post_edit', 'blog_app_blog_feed', 'blog_index', 'blog_show', 'debug_page', 'homepage', 'legacy_archive', 'legacy_debug']);
- assert.equal(routes!.items[3].labelDetails?.description, '/blog');
+ assert.deepEqual(routes!.items.map(i => i.label), ['_preview_error', '_wdt', 'acme_panel', 'admin_dashboard', 'admin_post_edit', 'api_status', 'api_v1_health', 'blog_app_blog_feed', 'blog_archive_list', 'blog_archive_year', 'blog_index', 'blog_show', 'debug_page', 'homepage', 'legacy_archive', 'legacy_debug', 'old_page', 'shop_catalog_index', 'shop_catalog_item']);
+ assert.equal(routes!.items.find(i => i.label === 'blog_index')!.labelDetails?.description, '/blog');
  const target = await h.define('src/Controller/BlogController.php', controller, routeSite + 2);
  assert.deepEqual(target!.map(l => [l.uri.split('/').pop(), l.range.start.line]), [['BlogController.php', line(controller, "name: 'index'")]]);
  const templates = await h.complete('src/Controller/BlogController.php', controller, at(controller, "render('"));

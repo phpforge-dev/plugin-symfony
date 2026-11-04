@@ -2,8 +2,9 @@ import { analyze, literalAt, phpTokens, position, segments, type PhpToken } from
 import { CompletionKind, type CodeCompletion, type CodeSite, type IdePlugin, type PluginCompletion, type PluginDiagnostic, type PluginLocation, type ProjectFiles, type StringSite } from './api';
 import type { PluginFix } from './extensions';
 import { maskEnv, readEnv, type EnvEntry } from '../../env-document';
-import { bundleTemplates, classFile, compiledContainer, parseBundles, parseContainerXml, parsePhpRoutes, parseXmlRoutes, psr4, type Bundle } from './symfony-config';
+import { bundleTemplates, classFile, compiledContainer, parseBundles, parseContainerXml, parseXmlRoutes, psr4, type Bundle } from './symfony-config';
 import { doctrineContext, entityByName, formOptions, formTranslationOption, nearest, parseEntity, repositoryEntity, type Entity, type Model } from './doctrine';
+import { compiledRoutesFile, parseCompiledRoutes, parsePhpRouting, parseXmlImports, parseYamlImports, prefixPath, type RouteImport } from './routing';
 import { loadCatalog, phpTransSite, phpTransSites, twigTransSite, twigTransSites, type Catalog, type TransSite } from './translations';
 
 // Symfony (symfony.com/doc): rotas por atributo `#[Route]`, YAML, PHP e XML, templates Twig
@@ -12,7 +13,7 @@ import { loadCatalog, phpTransSite, phpTransSites, twigTransSite, twigTransSites
 // e traduções.
 // Implementação própria a partir da documentação pública; não usa código de plugins existentes.
 
-export type SymfonyRoute = { name: string; path: string; methods: string; file: string; line: number; character: number; length: number; generated?: boolean };
+export type SymfonyRoute = { name: string; path: string; methods: string; file: string; line: number; character: number; length: number; generated?: boolean; compiled?: boolean };
 export type YamlKey = { key: string; file: string; line: number; character: number; value?: string; class?: string; compiled?: boolean };
 
 const argumentsAt = (tokens: PhpToken[], open: number) => {
@@ -141,6 +142,78 @@ export function referenceAt(before: string): { kind: 'service' | 'parameter' | '
  return null;
 }
 
+const dirname = (path: string) => path.split('/').slice(0, -1).join('/');
+const normalizePath = (path: string) => { const out: string[] = []; for (const p of path.split('/')) { if (!p || p === '.') continue; if (p === '..') out.pop(); else out.push(p); } return out.join('/'); };
+const isRouteConfig = (p: string) => /^config\/routes(\.\w+$|\/)/.test(p) && /\.(ya?ml|php|xml)$/.test(p);
+type Target = { file: string; attribute: boolean };
+
+/**
+ * Rotas do projeto como o Routing as carrega: arquivos de config/routes* que nenhum outro importa são
+ * raízes; imports aplicam `prefix`/`name_prefix` ao que carregam (configs, controllers por atributo,
+ * diretórios e globs, `@Bundle/`). Controllers que nenhum import alcança entram sem prefixo.
+ * Rotas só do gerador compilado (bundles, `_wdt`…) completam a lista.
+ */
+export async function loadRoutes(files: ProjectFiles, bundles: () => Promise<(Bundle & { file: string | null })[]>): Promise<SymfonyRoute[]> {
+ const configs = (await files.list('config', n => /\.(ya?ml|php|xml)$/.test(n))).filter(isRouteConfig).sort();
+ const cache = new Map<string, { routes: SymfonyRoute[]; imports: RouteImport[] }>();
+ const parse = async (file: string, attribute: boolean) => {
+  const key = `${attribute}:${file}`; const hit = cache.get(key); if (hit) return hit;
+  const text = (await files.read(file)) ?? ''; let result: { routes: SymfonyRoute[]; imports: RouteImport[] };
+  if (attribute) result = { routes: text.includes('Route') ? parseRouteAttributes(text, file) : [], imports: [] };
+  else if (file.endsWith('.php')) result = parsePhpRouting(text, file);
+  else if (file.endsWith('.xml')) result = { routes: parseXmlRoutes(text, file), imports: parseXmlImports(text, file) };
+  else result = { routes: parseYamlRoutes(text, file), imports: parseYamlImports(text, file) };
+  cache.set(key, result); return result;
+ };
+ const resolve = async (imp: RouteImport): Promise<Target[]> => {
+  let path: string;
+  const bundle = /^@(\w+)\/(.*)$/.exec(imp.resource);
+  if (bundle) { const b = (await bundles()).find(x => x.name === bundle[1] || x.name === bundle[1] + 'Bundle'); if (!b?.file) return []; path = normalizePath(`${dirname(b.file)}/${bundle[2]}`); }
+  else path = normalizePath(`${dirname(imp.file)}/${imp.resource}`);
+  const attribute = imp.type === 'attribute' || imp.type === 'annotation';
+  if (path.includes('*') || path.includes('{')) {
+   const base = path.slice(0, path.search(/[*{]/)).replace(/\/[^/]*$/, '');
+   const re = new RegExp('^' + path.replace(/[.+^$()|[\]\\]/g, '\\$&').replace(/\{([^}]*)\}/g, (_, a: string) => `(${a.split(',').join('|')})`).replace(/\*\*\//g, '(?:.*/)?').replace(/\*/g, '[^/]*') + '$');
+   return (await files.list(base, () => true)).filter(f => re.test(f)).sort().map(file => ({ file, attribute: attribute || (file.endsWith('.php') && !file.startsWith('config/')) }));
+  }
+  if (/\.(ya?ml|xml|php)$/.test(path)) return await files.exists(path) ? [{ file: path, attribute: attribute || (path.endsWith('.php') && !path.startsWith('config/')) }] : [];
+  // Diretório: controllers (atributos) ou arquivos de configuração de rotas.
+  const list = (await files.list(path.replace(/\/$/, ''), n => /\.(php|ya?ml|xml)$/.test(n))).sort();
+  return attribute || !path.startsWith('config') ? list.filter(f => f.endsWith('.php')).map(file => ({ file, attribute: true })) : list.map(file => ({ file, attribute: false }));
+ };
+ // Arquivos alcançados por algum import deixam de ser raízes.
+ const imported = new Set<string>();
+ for (const file of configs) for (const imp of (await parse(file, false)).imports) for (const t of await resolve(imp)) imported.add(`${t.attribute}:${t.file}`);
+ const out: SymfonyRoute[] = []; const seen = new Set<string>(); const reached = new Set<string>();
+ const emit = (r: SymfonyRoute) => { const key = `${r.name}\0${r.path}\0${r.file}\0${r.line}`; if (!seen.has(key)) { seen.add(key); out.push(r); } };
+ const visit = async (target: Target, prefix: string, namePrefix: string, trailing: boolean, stack: string[]) => {
+  const key = `${target.attribute}:${target.file}`; if (stack.includes(key) || stack.length > 12) return;
+  reached.add(key);
+  const { routes, imports } = await parse(target.file, target.attribute);
+  for (const r of routes) emit({ ...r, name: namePrefix + r.name, path: prefix ? prefixPath(prefix, r.path, trailing) : r.path });
+  for (const imp of imports) {
+   const nested = imp.prefix ? (prefix ? prefixPath(prefix, prefixPath(imp.prefix, '')) : imp.prefix) : prefix;
+   for (const t of await resolve(imp)) await visit(t, nested, namePrefix + imp.namePrefix, imp.trailingSlashOnRoot, [...stack, key]);
+  }
+ };
+ for (const file of configs) if (!imported.has(`false:${file}`)) await visit({ file, attribute: false }, '', '', true, []);
+ for (const file of (await files.list('src', n => n.endsWith('.php'))).sort()) if (!reached.has(`true:${file}`)) await visit({ file, attribute: true }, '', '', true, []);
+ // Gerador compilado: completa com o que a configuração não declara (rotas de bundles).
+ const compiled = await compiledRoutesFile(files);
+ if (compiled) {
+  const known = new Set(out.map(r => r.name)); const map = await psr4(files);
+  for (const r of parseCompiledRoutes((await files.read(compiled)) ?? '', compiled)) {
+   if (known.has(r.name)) continue;
+   const { controller, ...route } = r; let place: Partial<SymfonyRoute> = {};
+   const m = controller ? /^\\?([\w\\]+)::(\w+)$/.exec(controller) : null;
+   const file = m ? await classFile(m[1], map, files) : null;
+   if (file) { const text = (await files.read(file)) ?? ''; const fn = new RegExp(`function\\s+(${m![2]})\\s*\\(`).exec(text); if (fn) place = { file, ...position(text, fn.index + fn[0].indexOf(fn[1])), length: fn[1].length }; }
+   out.push({ ...route, ...place, compiled: true });
+  }
+ }
+ return out;
+}
+
 export class SymfonyPlugin implements IdePlugin {
  readonly id = 'symfony';
  readonly name = 'Symfony';
@@ -162,20 +235,9 @@ export class SymfonyPlugin implements IdePlugin {
   return { version: version ? `${version[1]}.${version[2]}` : undefined };
  }
  documents(path: string) { return path.endsWith('.php') || (path.startsWith('templates/') && path.endsWith('.twig')) || (path.startsWith('config/') && /\.ya?ml$/.test(path)); }
- invalidates(path: string) { return /^(src|config|templates|translations)\//.test(path) || /^\.env(\.|$)/.test(path) || /^var\/cache\/[^/]+\/\w+Container\.xml$/.test(path) || path === 'vendor/composer/installed.json' || path === 'composer.json'; }
+ invalidates(path: string) { return /^(src|config|templates|translations)\//.test(path) || /^\.env(\.|$)/.test(path) || /^var\/cache\/[^/]+\/(\w+Container\.xml|url_generating_routes\.php)$/.test(path) || path === 'vendor/composer/installed.json' || path === 'composer.json'; }
  invalidate() { this.routes = this.templates = this.container = this.env = this.bundles = this.model = this.catalog = undefined; }
- private allRoutes(files: ProjectFiles) {
-  return this.routes ??= (async () => {
-   const out: SymfonyRoute[] = [];
-   for (const p of await files.list('src', n => n.endsWith('.php'))) { const text = await files.read(p); if (text?.includes('Route')) out.push(...parseRouteAttributes(text, p)); }
-   for (const p of await files.list('config', n => /\.(ya?ml|php|xml)$/.test(n))) {
-    if (!/^config\/routes(\.\w+$|\/)/.test(p)) continue;
-    const text = (await files.read(p)) ?? '';
-    out.push(...(p.endsWith('.php') ? parsePhpRoutes(text, p) : p.endsWith('.xml') ? parseXmlRoutes(text, p) : parseYamlRoutes(text, p)));
-   }
-   return out;
-  })();
- }
+ private allRoutes(files: ProjectFiles) { return this.routes ??= loadRoutes(files, () => this.allBundles(files)); }
  /** Nome lógico → arquivo: `templates/` do projeto e `@Alias/` dos bundles ativos. */
  private allTemplates(files: ProjectFiles) {
   return this.templates ??= (async () => {
@@ -247,7 +309,7 @@ export class SymfonyPlugin implements IdePlugin {
  }
  private async candidates(kind: Kind, files: ProjectFiles): Promise<PluginCompletion[]> {
   if (kind === 'route') return (await this.allRoutes(files)).slice().sort((a, b) => a.name.localeCompare(b.name))
-   .map(r => ({ label: r.name, kind: CompletionKind.Reference, labelDetails: { detail: ` ${r.methods}`, description: r.path }, detail: `${r.file}:${r.line + 1}${r.generated ? ' · nome automático' : ''}` }));
+   .map(r => ({ label: r.name, kind: CompletionKind.Reference, labelDetails: { ...(r.methods ? { detail: ` ${r.methods}` } : {}), description: r.path }, detail: `${r.file}:${r.line + 1}${r.generated ? ' · nome automático' : ''}${r.compiled ? ' · rotas compiladas' : ''}` }));
   if (kind === 'template') return [...(await this.allTemplates(files))].map(([t, file]) => ({ label: t, kind: CompletionKind.File, ...(t.startsWith('@') ? { detail: file } : {}) }));
   if (kind === 'env') return [...(await this.allEnv(files)).values()].sort((a, b) => a.key.localeCompare(b.key))
    .map(e => ({ label: e.key, kind: CompletionKind.Constant, labelDetails: { detail: ` = ${maskEnv(e.key, e.value)}` }, detail: e.file }));
