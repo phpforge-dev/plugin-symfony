@@ -1,6 +1,7 @@
 import { analyze, phpTokens, position, type PhpToken } from '../php-source';
 import { CompletionKind, type CodeCompletion, type CodeSite, type IdePlugin, type PluginCompletion, type PluginLocation, type ProjectFiles, type StringSite } from './api';
 import { maskEnv, readEnv, type EnvEntry } from '../../env-document';
+import { parsePhpRoutes, parseXmlRoutes } from './symfony-config';
 
 // Symfony (symfony.com/doc): rotas por atributo `#[Route]` e YAML, templates Twig,
 // serviços e parâmetros de config/*.yaml e `%env()%` ligado aos arquivos .env.
@@ -159,7 +160,11 @@ export class SymfonyPlugin implements IdePlugin {
   return this.routes ??= (async () => {
    const out: SymfonyRoute[] = [];
    for (const p of await files.list('src', n => n.endsWith('.php'))) { const text = await files.read(p); if (text?.includes('Route')) out.push(...parseRouteAttributes(text, p)); }
-   for (const p of await files.list('config', n => /\.ya?ml$/.test(n))) if (/^config\/routes(\.ya?ml$|\/)/.test(p)) out.push(...parseYamlRoutes((await files.read(p)) ?? '', p));
+   for (const p of await files.list('config', n => /\.(ya?ml|php|xml)$/.test(n))) {
+    if (!/^config\/routes(\.\w+$|\/)/.test(p)) continue;
+    const text = (await files.read(p)) ?? '';
+    out.push(...(p.endsWith('.php') ? parsePhpRoutes(text, p) : p.endsWith('.xml') ? parseXmlRoutes(text, p) : parseYamlRoutes(text, p)));
+   }
    return out;
   })();
  }
@@ -277,4 +282,6 @@ export class SymfonyPlugin implements IdePlugin {
   const found = this.referenceUnder(line, col);
   return found ? this.locate(found.kind, found.word, files) : null;
  }
+
+
 }

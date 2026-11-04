@@ -63,8 +63,8 @@ test('PHP: completion e navegação de rotas, templates, parâmetros e Autowire'
  const h = host();
  const routeSite = at(controller, "redirectToRoute('");
  const routes = await h.complete('src/Controller/BlogController.php', controller, routeSite);
- assert.deepEqual(routes!.items.map(i => i.label), ['blog_app_blog_feed', 'blog_index', 'blog_show', 'debug_page', 'homepage']);
- assert.equal(routes!.items[1].labelDetails?.description, '/blog');
+ assert.deepEqual(routes!.items.map(i => i.label), ['admin_dashboard', 'admin_post_edit', 'blog_app_blog_feed', 'blog_index', 'blog_show', 'debug_page', 'homepage', 'legacy_archive', 'legacy_debug']);
+ assert.equal(routes!.items[3].labelDetails?.description, '/blog');
  const target = await h.define('src/Controller/BlogController.php', controller, routeSite + 2);
  assert.deepEqual(target!.map(l => [l.uri.split('/').pop(), l.range.start.line]), [['BlogController.php', line(controller, "name: 'index'")]]);
  const templates = await h.complete('src/Controller/BlogController.php', controller, at(controller, "render('"));

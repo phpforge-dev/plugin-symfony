@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<routes xmlns="http://symfony.com/schema/routing"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://symfony.com/schema/routing https://symfony.com/schema/routing/routing-1.0.xsd">
+    <!-- <route id="commented_out" path="/nope"/> -->
+    <route id="legacy_archive" path="/archive/{year}" controller="App\Controller\LegacyController::archive" methods="GET|POST"/>
+    <when env="dev">
+        <route id="legacy_debug" path="/_legacy">
+            <default key="_controller">App\Controller\LegacyController::debug</default>
+        </route>
+    </when>
+    <import resource="../../src/Controller/" type="attribute"/>
+</routes>
